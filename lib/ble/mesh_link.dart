@@ -105,9 +105,13 @@ class MeshLink {
   bool get running => _running;
 
   /// Adapter state as plain text, so the UI never has to import the plugin.
+  /// Adapter state as plain text, so the UI never has to import the plugin.
   String get adapterState => _central.state.name;
 
+  /// Peers we connected out to, where we are the central.
   int get outboundPeers => _links.length;
+
+  /// Peers that connected in to us, where we are the peripheral.
   int get inboundPeers => _centrals.length;
 
   void _log(LogLevel level, String text) {
@@ -251,8 +255,8 @@ class MeshLink {
 
     for (final link in _links.values.toList()) {
       if (bytes.length > link.maxWrite) {
-        _log(
-            LogLevel.warn, 'too long for ${_short('${link.peripheral.uuid}')}');
+        final peer = _short('${link.peripheral.uuid}');
+        _log(LogLevel.warn, 'too long for $peer');
         continue;
       }
       try {
