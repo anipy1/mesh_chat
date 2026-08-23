@@ -111,6 +111,8 @@ class MeshLink {
   int get inboundPeers => _centrals.length;
 
   void _log(LogLevel level, String text) {
+    // TODO (Part 4): mirror this to the platform log as well, so it can be
+    // read with `adb logcat` instead of by scrolling a phone screen.
     final line = LogLine(level, text);
     _history.add(line);
     if (_history.length > 400) _history.removeAt(0);
@@ -261,6 +263,8 @@ class MeshLink {
           type: GATTCharacteristicWriteType.withResponse,
         );
       } catch (e) {
+        // TODO (Part 4): clip this to the first line. A Java stack trace in a
+        // small log pane buries the one line that matters.
         _log(LogLevel.error, 'write failed: $e');
       }
     }
@@ -294,6 +298,15 @@ class MeshLink {
   // -------------------------------------------------------- peripheral wiring
 
   void _wirePeripheral() {
+    // TODO (Part 4): guard every one of these subscriptions. Some of these
+    // streams do not exist on every platform, and touching one that does not
+    // takes the whole app down before it draws a single frame.
+    _subs.add(
+      _peripheral.stateChanged.listen((e) {
+        _log(LogLevel.info, 'peripheral adapter ${e.state.name}');
+      }),
+    );
+
     _subs.add(
       _peripheral.characteristicNotifyStateChanged.listen((e) async {
         if (e.characteristic.uuid != _txUuid) return;
@@ -329,6 +342,12 @@ class MeshLink {
   // ----------------------------------------------------------- central wiring
 
   void _wireCentral() {
+    _subs.add(
+      _central.stateChanged.listen((e) {
+        _log(LogLevel.info, 'central adapter ${e.state.name}');
+      }),
+    );
+
     _subs.add(
       _central.discovered.listen((e) async {
         final key = '${e.peripheral.uuid}';
