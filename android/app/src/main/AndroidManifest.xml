@@ -1,5 +1,5 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- TODO: Add the Bluetooth permissions here -->
+    <!-- TODO (Part 3): Add the Bluetooth permissions here -->
 
     <application
         android:label="mesh_chat"

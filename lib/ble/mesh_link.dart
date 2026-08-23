@@ -1,6 +1,6 @@
 import 'dart:async';
 
-// TODO: Import the bluetooth_low_energy package
+// TODO (Part 3): Import the bluetooth_low_energy package
 
 import 'link_ids.dart';
 
@@ -39,14 +39,14 @@ class InboundMessage {
 /// One phone in the mesh, running both GATT roles at the same time.
 class MeshLink {
   MeshLink() : nodeId = newNodeId() {
-    // TODO: Wire up the peripheral role listeners
-    // TODO: Wire up the central role listeners
+    // TODO (Part 3): Wire up the peripheral role listeners
+    // TODO (Part 3): Wire up the central role listeners
   }
 
   /// Short id for this phone, shown in the app bar and in the logs.
   final String nodeId;
 
-  // TODO: Create the CentralManager and PeripheralManager
+  // TODO (Part 3): Create the CentralManager and PeripheralManager
 
   final _logs = StreamController<LogLine>.broadcast();
   final _messages = StreamController<InboundMessage>.broadcast();
@@ -66,19 +66,19 @@ class MeshLink {
 
   /// Adapter state as plain text, so the UI never has to import the plugin.
   String get adapterState {
-    // TODO: Report the real adapter state
+    // TODO (Part 3): Report the real adapter state
     return 'unknown';
   }
 
   /// Peers we connected out to, where we are the central.
   int get outboundPeers {
-    // TODO: Report the number of outbound links
+    // TODO (Part 3): Report the number of outbound links
     return 0;
   }
 
   /// Peers that connected in to us, where we are the peripheral.
   int get inboundPeers {
-    // TODO: Report the number of inbound centrals
+    // TODO (Part 3): Report the number of inbound centrals
     return 0;
   }
 
@@ -94,13 +94,13 @@ class MeshLink {
   Future<void> start() async {
     if (_running) return;
 
-    // TODO: Ask for permission and wait for the adapter to power on
+    // TODO (Part 3): Ask for permission and wait for the adapter to power on
 
-    // TODO: Build the GATT service with the TX and RX characteristics
+    // TODO (Part 3): Build the GATT service with the TX and RX characteristics
 
-    // TODO: Start advertising the mesh service
+    // TODO (Part 3): Start advertising the mesh service
 
-    // TODO: Start scanning, filtered on the mesh service
+    // TODO (Part 3): Start scanning, filtered on the mesh service
 
     _running = true;
   }
@@ -109,14 +109,14 @@ class MeshLink {
     if (!_running) return;
     _running = false;
 
-    // TODO: Stop advertising, stop scanning and drop the connections
+    // TODO (Part 3): Stop advertising, stop scanning and drop the connections
 
     _log(LogLevel.info, 'stopped');
   }
 
   /// Sends [text] to every connected peer.
   Future<void> send(String text) async {
-    // TODO: Send to every connected peer
+    // TODO (Part 3): Send to every connected peer
   }
 
   Future<void> dispose() async {

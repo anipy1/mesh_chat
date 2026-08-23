@@ -26,7 +26,7 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-	<!-- TODO: Add the Bluetooth usage descriptions here -->
+	<!-- TODO (Part 3): Add the Bluetooth usage descriptions here -->
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

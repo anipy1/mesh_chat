@@ -9,7 +9,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  # TODO: Add the bluetooth_low_energy package here
+  # TODO (Part 3): Add the bluetooth_low_energy package here
 
 dev_dependencies:
   flutter_test:
