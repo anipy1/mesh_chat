@@ -854,7 +854,8 @@ class MeshLink {
       }
       _cancelPrune(key);
       if (_isBlockedId(peerId)) {
-        _log(LogLevel.warn, 'hello from blocked $peerId -- dropping leg');
+        _log(LogLevel.warn,
+            'hello from blocked ${labelOf(peerId)} -- dropping leg');
         if (via == 'notify') {
           _outPeerId[key] = peerId;
         } else {
@@ -863,7 +864,7 @@ class MeshLink {
         _dropPeer(peerId);
         return;
       }
-      _log(LogLevel.info, 'hello from $peerId via $via');
+      _log(LogLevel.info, 'hello from ${labelOf(peerId)} via $via');
 
       // Answer on the same leg. Relying on the peer's subscribe event to
       // trigger their hello leaves a leg unidentified whenever that event
@@ -1566,7 +1567,7 @@ class MeshLink {
       _dialling.remove(k);
       return true;
     });
-    _log(LogLevel.info, '$peerId gone -- dialling re-armed');
+    _log(LogLevel.info, '${labelOf(peerId)} gone -- dialling re-armed');
   }
 
   /// Retires legs to [peerId] other than [keepKey], in the same direction.
@@ -1593,7 +1594,8 @@ class MeshLink {
           continue;
         }
         _retiredKeys.add(key);
-        _log(LogLevel.info, 'retiring stale leg to $peerId (${_short(key)})');
+        _log(LogLevel.info,
+            'retiring stale leg to ${labelOf(peerId)} (${_short(key)})');
         _central.disconnect(link.peripheral).catchError((Object e) {
           // The address is already gone often enough that this is expected.
           _retiredKeys.remove(key);
@@ -1614,7 +1616,8 @@ class MeshLink {
       _inPeerId.remove(key);
       _helloSent.remove(key);
       _linkWrites.remove(key);
-      _log(LogLevel.info, 'forgetting stale leg from $peerId (${_short(key)})');
+      _log(LogLevel.info,
+          'forgetting stale leg from ${labelOf(peerId)} (${_short(key)})');
     }
   }
 
@@ -1659,7 +1662,7 @@ class MeshLink {
     if (legs > 1) {
       _log(
         LogLevel.info,
-        '$peerId reachable on $legs legs -- sending on one',
+        '${labelOf(peerId)} reachable on $legs legs -- sending on one',
       );
     }
   }
