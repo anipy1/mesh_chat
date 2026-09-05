@@ -12,7 +12,7 @@ as long as a third phone is somewhere in between.
 |---|---|
 | `starter` | The UI, complete, with `// TODO` comments where the logic goes. Start here. |
 | `part-03` | After Part 3: two phones exchanging bytes. |
-| `main` | The finished thing. |
+| `main` | The finished thing: relay, flood damping, identity, the lot. |
 
 Each part of the series has its own branch, so you can either follow along on
 `starter` and write the code yourself, or check out the branch for a part and read
@@ -37,6 +37,10 @@ a laptop.
 Mixed platforms are better than matched ones. Two Android phones talking to each
 other work far more smoothly than Android talking to iOS, and that smoothness
 hides most of the interesting problems.
+
+## Where the blog articles live
+
+`blog/` holds the written parts. They teach the code on the `part-*` branches.
 
 ## The series
 

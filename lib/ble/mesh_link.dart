@@ -1,21 +1,17 @@
 import 'dart:async';
-import 'dart:convert';
+import 'dart:math';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
+import 'package:flutter/foundation.dart';
 
+import 'frame.dart';
 import 'link_ids.dart';
 
 enum LogLevel { info, tx, rx, warn, error }
 
-/// One line in the in-app log.
-///
-/// A mesh runs on two or more phones at once, and you cannot attach a debugger
-/// to two phones at the same time. So the log goes on the screen.
 class LogLine {
   LogLine(this.level, this.text) : time = DateTime.now();
-
   final DateTime time;
   final LogLevel level;
   final String text;
@@ -25,47 +21,41 @@ class LogLine {
       '${time.millisecond.toString().padLeft(3, '0')}';
 }
 
-/// A message that arrived from another phone.
 class InboundMessage {
-  InboundMessage({required this.text, required this.peer, required this.via});
-
-  final String text;
-
-  /// Which peer handed it to us.
+  InboundMessage({required this.frame, required this.via, required this.peer});
+  final Frame frame;
+  final String via; // 'notify' (we are central) or 'write' (we are peripheral)
   final String peer;
-
-  /// How it reached us: `write` if we are the peripheral, `notify` if we are
-  /// the central.
-  final String via;
 }
 
-/// A peer we connected out to, so we are the central and it is the peripheral.
+/// A peer we connected outward to. We are central, it is peripheral.
 class _OutboundLink {
   _OutboundLink({
     required this.peripheral,
+    required this.tx,
     required this.rx,
     required this.maxWrite,
   });
-
   final Peripheral peripheral;
-
-  /// The characteristic we write to in order to send.
+  final GATTCharacteristic tx;
   final GATTCharacteristic rx;
-
-  /// Largest payload this connection will accept in one write.
   int maxWrite;
+  final DateTime connectedAt = DateTime.now();
 }
 
-/// One phone in the mesh, running both GATT roles at the same time.
+/// One device, both GATT roles at once -- the bitchat topology.
+///
+/// Which role actually carries a given peer is decided by a tie-break on the
+/// advertised node id, so exactly one side dials. Both stacks stay live either
+/// way, and messages flow in both directions regardless of who dialled:
+/// central->peripheral by writing RX, peripheral->central by notifying TX.
 class MeshLink {
   MeshLink() : nodeId = newNodeId() {
     _wirePeripheral();
     _wireCentral();
   }
 
-  /// Short id for this phone, shown in the app bar and in the logs.
   final String nodeId;
-
   final CentralManager _central = CentralManager();
   final PeripheralManager _peripheral = PeripheralManager();
 
@@ -73,323 +63,1098 @@ class MeshLink {
   final _txUuid = UUID.fromString(kTxCharacteristicUuidString);
   final _rxUuid = UUID.fromString(kRxCharacteristicUuidString);
 
-  /// Our own TX characteristic. Kept because notifying needs the object, not
-  /// just the UUID.
+  // Only TX is kept: notifying needs the characteristic object, whereas
+  // inbound writes are identified by UUID off the event.
   GATTCharacteristic? _myTx;
 
-  /// Peers we dialled, keyed by the peripheral's uuid.
-  final Map<String, _OutboundLink> _links = {};
-
-  /// Peers that dialled us and subscribed to our TX, so we can notify them.
+  // Peripheral role: centrals connected to us, and which have subscribed.
   final Map<String, Central> _centrals = {};
   final Map<String, int> _notifyLimit = {};
 
-  /// Peers we have a connection attempt in flight for, so discovery does not
-  /// dial the same phone over and over.
+  /// Peer node ids learned from the in-band hello, keyed by transport key.
+  /// Kept separately per direction because the same physical device has two
+  /// unrelated identifiers: a Peripheral uuid when we dial it, and a Central
+  /// uuid when it dials us. The hello is the only thing that ties them together.
+  final Map<String, String> _outPeerId = {};
+  final Map<String, String> _inPeerId = {};
+
+  // Central role: peers we dialled.
+  final Map<String, _OutboundLink> _links = {};
   final Set<String> _dialling = {};
 
-  final _logs = StreamController<LogLine>.broadcast();
-  final _messages = StreamController<InboundMessage>.broadcast();
-  final List<StreamSubscription<dynamic>> _subs = [];
+  /// Peer node ids whose link we deliberately gave up in
+  /// [_resolveDuplicateLink], and the transport keys they were reached on.
+  /// Without this the drop immediately re-arms discovery and the pair spins:
+  /// dial -> hello -> drop -> rediscover -> dial.
+  final Set<String> _yieldedTo = {};
 
-  /// Log lines emitted before the UI subscribed. A broadcast stream drops
-  /// events when nobody is listening, and the earliest lines are often the
-  /// most useful ones.
+  /// Transport keys we hung up on ourselves. Needed separately from
+  /// [_yieldedTo] because the disconnect callback arrives *after*
+  /// _resolveDuplicateLink has already cleared _outPeerId, so the node id is no
+  /// longer available to attribute the disconnect by.
+  final Set<String> _yieldedKeys = {};
+
+  /// Legs we have already sent our hello on. Guards the reply below against
+  /// ping-ponging: A announces, B replies, A sees it has already announced and
+  /// stops.
+  final Set<String> _helloSent = {};
+
+  /// Live prune timers, keyed by transport key. Tracked so a re-subscribe can
+  /// restart the clock and a hello can cancel it outright -- an untracked timer
+  /// from a previous connection cycle will happily fire during the next one and
+  /// prune a perfectly healthy peer.
+  final Map<String, Timer> _pruneTimers = {};
+
+  /// Node ids we are pretending not to hear, so an A-B-C line topology can be
+  /// created on one desk. A blocked peer is dropped in *both* directions --
+  /// nothing is sent to it and nothing is accepted from it -- because a
+  /// half-blocked peer is not a partition, it is a confusing bug.
+  final Set<String> _blocked = {};
+
+  /// Everything the radio can currently see, whether or not we linked to it.
+  /// This is the instrument for "is C actually out of range?" -- absence here
+  /// is the evidence, and it is independent of whether a link happened to form.
+  final Map<String, ObservedPeer> _observed = {};
+
+  /// Exponential backoff per transport key. A link that dies seconds after it
+  /// forms will die again if we redial immediately, and discovery re-arms us
+  /// within milliseconds -- which turns one bad pairing into a tight loop that
+  /// saturates the radio. Observed between Android and iOS, where the two legs
+  /// to one peer are not as independent as the model assumes.
+  final Map<String, DateTime> _backoffUntil = {};
+  final Map<String, int> _flaps = {};
+
+  /// Transport keys with a live GATT connection. `_setUpOutbound` runs a long
+  /// await chain (mtu -> discover -> subscribe -> limits -> hello) and the
+  /// connection can die at any point in it; without this each remaining step
+  /// throws a different platform exception and one dead link looks like four
+  /// unrelated bugs.
+  final Set<String> _connected = {};
+
+  /// Relays waiting out their random assessment delay, keyed by msgId.
+  final Map<String, _PendingRelay> _pendingRelays = {};
+  final Random _rnd = Random();
+  int _relayed = 0;
+  int _suppressed = 0;
+
+  /// Random assessment delay before relaying. Every node that received the same
+  /// frame waits a different amount of time, so they do not all rebroadcast at
+  /// once and each gets a chance to notice that someone else already did.
+  ///
+  /// The window has to be large relative to how long a relay takes to *arrive*,
+  /// not just how long we wait. Measured on real hardware at 40-200ms, a
+  /// three-node desk test relayed 6 of 7 frames and suppressed 1: a BLE write
+  /// round trip is itself 30-100ms, so a peer's relay usually landed after our
+  /// timer had already fired and the evidence arrived too late to act on.
+  /// 150-600ms leaves room to actually hear it. The cost is latency per hop --
+  /// with ttl 3 that is two hops, so under ~1.2s worst case, which a messaging
+  /// app can afford and a broadcast storm cannot.
+  static const _radMinMs = 150;
+  static const _radSpreadMs = 450;
+
+  /// Hearing the same frame from one other node during the delay is enough to
+  /// conclude our neighbourhood is already covered.
+  static const _suppressAfterHeard = 1;
+  static const _flapWindow = Duration(seconds: 6);
+  static const _backoffCap = Duration(seconds: 30);
+
+  // Bounded dedup. Insertion-ordered so eviction is FIFO.
+  final Set<String> _seen = {};
+  static const _seenCap = 512;
+
+  final _logs = StreamController<LogLine>.broadcast();
+
+  /// Log lines emitted before anyone subscribed. The constructor logs platform
+  /// capability gaps, and a broadcast controller drops events with no listener,
+  /// so without this the most diagnostic lines in the whole app are invisible.
   final List<LogLine> _history = [];
+  final _messages = StreamController<InboundMessage>.broadcast();
+  final List<StreamSubscription> _subs = [];
 
   bool _running = false;
 
   Stream<LogLine> get logs => _logs.stream;
   Stream<InboundMessage> get messages => _messages.stream;
-  List<LogLine> get history => List.unmodifiable(_history);
   bool get running => _running;
+  BluetoothLowEnergyState get state => _central.state;
 
-  /// Adapter state as plain text, so the UI never has to import the plugin.
-  /// Adapter state as plain text, so the UI never has to import the plugin.
-  String get adapterState => _central.state.name;
-
-  /// Peers we connected out to, where we are the central.
   int get outboundPeers => _links.length;
-
-  /// Peers that connected in to us, where we are the peripheral.
   int get inboundPeers => _centrals.length;
+  int get subscribedCentrals => _notifyLimit.length;
+
+  /// Distinct peers, by node id. Counting transport legs double-counts on
+  /// Android, where a Central and a Peripheral for the same device both derive
+  /// their uuid from the same MAC and are therefore the same key.
+  Set<String> get knownPeers => {..._outPeerId.values, ..._inPeerId.values};
+
+  List<String> get peerLabels => [
+        ..._links.keys.map((k) => 'out ${_outPeerId[k] ?? _short(k)}'),
+        ..._centrals.keys.map(
+          (k) => 'in ${_inPeerId[k] ?? _short(k)}'
+              '${_notifyLimit.containsKey(k) ? '*' : ''}',
+        ),
+      ];
+
+  /// Best-known human label for a transport key, either direction.
+  String _label(String key) => _outPeerId[key] ?? _inPeerId[key] ?? _short(key);
+
+  Set<String> get blocked => Set.unmodifiable(_blocked);
+
+  int get relayedCount => _relayed;
+  int get suppressedCount => _suppressed;
+
+  /// How long a sighting stays listed. Entries must expire, or the row shows
+  /// peers that were in range earlier -- which destroys the one measurement the
+  /// row exists for: "C never appeared, so C is out of range."
+  static const observedTtl = Duration(seconds: 30);
+
+  /// Radio-visible peers seen within [observedTtl], strongest first.
+  List<ObservedPeer> get observed {
+    _observed.removeWhere((_, o) => o.age > observedTtl);
+    final list = _observed.values.toList()
+      ..sort((a, b) => b.rssi.compareTo(a.rssi));
+    return list;
+  }
+
+  void block(String nodeId) {
+    if (!_blocked.add(nodeId)) return;
+    _log(LogLevel.warn, 'blocking $nodeId -- simulating out of range');
+    _dropPeer(nodeId);
+  }
+
+  void unblock(String nodeId) {
+    if (!_blocked.remove(nodeId)) return;
+    _log(LogLevel.info, 'unblocked $nodeId');
+    _unsuppress(nodeId);
+  }
+
+  /// Tears down every leg to [nodeId] in both directions.
+  void _dropPeer(String nodeId) {
+    for (final key in _outPeerId.entries
+        .where((e) => e.value == nodeId)
+        .map((e) => e.key)
+        .toList()) {
+      final link = _links.remove(key);
+      _outPeerId.remove(key);
+      _helloSent.remove(key);
+      _yieldedKeys.add(key); // keep discovery from redialling it
+      if (link == null) continue;
+      _central.disconnect(link.peripheral).catchError((Object e) {
+        _log(LogLevel.warn, 'disconnect blocked peer: $e');
+      });
+    }
+    for (final key in _inPeerId.entries
+        .where((e) => e.value == nodeId)
+        .map((e) => e.key)
+        .toList()) {
+      _cancelPrune(key);
+      _centrals.remove(key);
+      _notifyLimit.remove(key);
+      _inPeerId.remove(key);
+      _helloSent.remove(key);
+    }
+  }
+
+  bool _isBlockedKey(String key) {
+    final id = _outPeerId[key] ?? _inPeerId[key];
+    return id != null && _blocked.contains(id);
+  }
+
+  List<LogLine> get history => List.unmodifiable(_history);
 
   void _log(LogLevel level, String text) {
-    // TODO (Part 4): mirror this to the platform log as well, so it can be
-    // read with `adb logcat` instead of by scrolling a phone screen.
+    // Mirror to the platform log as well as the in-app pane. Reading a long
+    // stack trace by scrolling a 480x640 screen is not a debugging strategy;
+    // `adb logcat -s flutter` is.
+    debugPrint('[mesh:${level.name}] $text');
     final line = LogLine(level, text);
     _history.add(line);
     if (_history.length > 400) _history.removeAt(0);
     if (!_logs.isClosed) _logs.add(line);
   }
 
-  /// Short label for a peer. Android builds a peer's uuid from its MAC address
-  /// and pads the front with zeros, so the first characters are useless. Take
-  /// the tail.
+  /// Android derives a peer's uuid from its MAC and zero-pads the *front*, so
+  /// the first 8 chars are all zeros and useless as a label. Take the tail.
+  /// First line of an exception, clipped. A Java stack trace in a 480x640 log
+  /// pane is noise, and the useful part is always the first line.
+  static String _brief(Object e) {
+    final first = e.toString().split('\n').first;
+    return first.length <= 110 ? first : '${first.substring(0, 110)}...';
+  }
+
   static String _short(String uuid) =>
       uuid.length <= 8 ? uuid : uuid.substring(uuid.length - 8);
 
-  // ------------------------------------------------------------------ startup
-
-  /// Brings up both GATT roles: advertise so others can find us, and scan so we
-  /// can find them.
-  Future<void> start() async {
-    if (_running) return;
-
-    if (!await _authorize()) return;
-
-    final tx = GATTCharacteristic.mutable(
-      uuid: _txUuid,
-      properties: [GATTCharacteristicProperty.notify],
-      permissions: [GATTCharacteristicPermission.read],
-      descriptors: [],
-    );
-    final rx = GATTCharacteristic.mutable(
-      uuid: _rxUuid,
-      properties: [
-        GATTCharacteristicProperty.write,
-        GATTCharacteristicProperty.writeWithoutResponse,
-      ],
-      permissions: [GATTCharacteristicPermission.write],
-      descriptors: [],
-    );
-    _myTx = tx;
-
-    await _peripheral.removeAllServices();
-    await _peripheral.addService(
-      GATTService(
-        uuid: _serviceUuid,
-        isPrimary: true,
-        includedServices: [],
-        characteristics: [tx, rx],
-      ),
-    );
-
-    await _peripheral.startAdvertising(
-      Advertisement(
-        name: Platform.isAndroid ? null : '$kNamePrefix$nodeId',
-        serviceUUIDs: [_serviceUuid],
-      ),
-    );
-    _log(LogLevel.info, 'advertising');
-
-    await _central.startDiscovery(serviceUUIDs: [_serviceUuid]);
-    _log(LogLevel.info, 'scanning for ${kServiceUuidString.substring(0, 8)}');
-
-    _running = true;
+  bool _markSeen(String msgId) {
+    if (_seen.contains(msgId)) return false;
+    _seen.add(msgId);
+    if (_seen.length > _seenCap) _seen.remove(_seen.first);
+    return true;
   }
 
-  /// Asks for permission on Android, then waits for the adapter to actually be
-  /// on. Permission being granted and the radio being powered on are two
-  /// different things, and starting the GATT server against an adapter that is
-  /// off throws a bare platform exception that tells you nothing.
-  Future<bool> _authorize() async {
-    if (Platform.isAndroid) {
-      for (final manager in [_central, _peripheral]) {
-        if (manager.state == BluetoothLowEnergyState.unauthorized) {
-          final granted = await manager.authorize();
-          _log(
-            granted ? LogLevel.info : LogLevel.warn,
-            'permission granted: $granted',
-          );
-        }
-      }
+  // ---------------------------------------------------------------- lifecycle
+
+  /// User intent, as distinct from [_running]. If the adapter is off when Start
+  /// is pressed, we hold this and bring the stack up by ourselves the moment it
+  /// powers on.
+  bool _wantRunning = false;
+
+  bool get wantRunning => _wantRunning;
+
+  Future<void> start() async {
+    if (_running) return;
+    _wantRunning = true;
+
+    await _authorize();
+
+    // authorize() returning true means the *permission* was granted. The
+    // adapter state arrives separately and asynchronously, so the cached value
+    // is still stale at this point. Starting the GATT server against an adapter
+    // that is not powered on throws a bare IllegalStateException from the
+    // Android platform channel, which tells the user nothing.
+    if (!await _waitForPoweredOn(const Duration(seconds: 6))) {
+      _log(
+        LogLevel.warn,
+        'adapter is ${_central.state.name} -- turn Bluetooth on. '
+        'Will start by itself once it powers on.',
+      );
+      return;
     }
 
-    if (_central.state == BluetoothLowEnergyState.poweredOn) return true;
+    await _startStack();
+  }
 
+  Future<bool> _waitForPoweredOn(Duration timeout) async {
+    if (_central.state == BluetoothLowEnergyState.poweredOn) return true;
     try {
       await _central.stateChanged
           .firstWhere((e) => e.state == BluetoothLowEnergyState.poweredOn)
-          .timeout(const Duration(seconds: 6));
+          .timeout(timeout);
       return true;
     } catch (_) {
+      return _central.state == BluetoothLowEnergyState.poweredOn;
+    }
+  }
+
+  bool _starting = false;
+
+  Future<void> _startStack() async {
+    // `_running` alone is not enough: it is only set at the very end, so two
+    // callers (start() and the poweredOn auto-resume) can both get past it
+    // during the awaits below and race. The second one used to fail with
+    // SCAN_FAILED_ALREADY_STARTED and leave _running false while the stack was
+    // in fact up -- which the UI then reported as "Bluetooth is off".
+    if (_running || _starting) return;
+    _starting = true;
+    try {
+      await _bringUp();
+    } finally {
+      _starting = false;
+    }
+  }
+
+  Future<void> _bringUp() async {
+    // Peripheral role is treated as optional on purpose. Some Android devices
+    // genuinely cannot advertise, and reporting that plainly is more useful
+    // than failing the whole spike -- central-only still proves half the path.
+    final peripheralState = _peripheral.state;
+    if (peripheralState == BluetoothLowEnergyState.poweredOn) {
+      try {
+        await _peripheral.removeAllServices();
+        final tx = GATTCharacteristic.mutable(
+          uuid: _txUuid,
+          properties: [GATTCharacteristicProperty.notify],
+          permissions: [GATTCharacteristicPermission.read],
+          descriptors: [],
+        );
+        final rx = GATTCharacteristic.mutable(
+          uuid: _rxUuid,
+          properties: [
+            GATTCharacteristicProperty.write,
+            GATTCharacteristicProperty.writeWithoutResponse,
+          ],
+          permissions: [GATTCharacteristicPermission.write],
+          descriptors: [],
+        );
+        _myTx = tx;
+        await _peripheral.addService(
+          GATTService(
+            uuid: _serviceUuid,
+            isPrimary: true,
+            includedServices: [],
+            characteristics: [tx, rx],
+          ),
+        );
+        // No name on Android. The plugin implements Advertisement.name there
+        // by calling BluetoothAdapter.setName(), which renames the *phone's*
+        // Bluetooth adapter system-wide and never restores it -- every car
+        // stereo and headset the user owns would start seeing "BM-XXXX". On
+        // iOS it sets CBAdvertisementDataLocalNameKey, a real
+        // per-advertisement field with no side effect, so it is safe there.
+        //
+        // Losing the name on Android costs nothing: identity is exchanged
+        // in-band via Frame.hello precisely so it need not ride the
+        // advertisement.
+        final advertisedName =
+            Platform.isAndroid ? null : '$kNamePrefix$nodeId';
+        await _peripheral.startAdvertising(
+          Advertisement(name: advertisedName, serviceUUIDs: [_serviceUuid]),
+        );
+        _log(
+          LogLevel.info,
+          advertisedName == null
+              ? 'advertising (unnamed -- android, see comment)'
+              : 'advertising as $advertisedName',
+        );
+      } catch (e) {
+        _myTx = null;
+        _log(
+          LogLevel.error,
+          'peripheral role failed ($e) -- continuing central-only, '
+          'this device can be found by nobody',
+        );
+      }
+    } else {
+      _myTx = null;
       _log(
         LogLevel.warn,
-        'adapter is ${_central.state.name}, switch Bluetooth on and try again',
+        'peripheral role unavailable (state ${peripheralState.name}) '
+        '-- central-only; this device cannot be discovered',
       );
-      return false;
+    }
+
+    // Central role. Always filtered by service UUID -- required on iOS to find
+    // a backgrounded peer at all.
+    // stopDiscovery first so a scan left running by a previous attempt (or by
+    // a hot restart) does not make this fail.
+    try {
+      await _central.stopDiscovery();
+    } catch (_) {
+      // Nothing was scanning. Fine.
+    }
+    try {
+      await _central.startDiscovery(serviceUUIDs: [_serviceUuid]);
+      _log(
+        LogLevel.info,
+        'scanning for service ${'$_serviceUuid'.substring(0, 8)}',
+      );
+      _running = true;
+    } catch (e) {
+      // Android error code 1 is SCAN_FAILED_ALREADY_STARTED: the scan we want
+      // is running, so this is success wearing an exception.
+      if (e.toString().contains('error code: 1')) {
+        _log(LogLevel.warn, 'scan was already running -- treating as started');
+        _running = true;
+      } else {
+        _log(LogLevel.error, 'startDiscovery failed: ${_brief(e)}');
+      }
     }
   }
 
   Future<void> stop() async {
+    _wantRunning = false;
     if (!_running) return;
     _running = false;
-
     for (final link in _links.values) {
       try {
         await _central.disconnect(link.peripheral);
-      } catch (_) {
-        // Already gone. Nothing to do.
-      }
+      } catch (_) {}
     }
     _links.clear();
+    _dialling.clear();
     _centrals.clear();
     _notifyLimit.clear();
-    _dialling.clear();
-
+    _outPeerId.clear();
+    _inPeerId.clear();
+    _yieldedTo.clear();
+    _yieldedKeys.clear();
+    _helloSent.clear();
+    for (final t in _pruneTimers.values) {
+      t.cancel();
+    }
+    _pruneTimers.clear();
+    _backoffUntil.clear();
+    _flaps.clear();
+    _observed.clear();
+    for (final r in _pendingRelays.values) {
+      r.timer?.cancel();
+    }
+    _pendingRelays.clear();
+    _connected.clear();
     try {
       await _central.stopDiscovery();
+    } catch (e) {
+      _log(LogLevel.warn, 'stopDiscovery: $e');
+    }
+    try {
       await _peripheral.stopAdvertising();
       await _peripheral.removeAllServices();
     } catch (e) {
-      _log(LogLevel.warn, 'while stopping: $e');
+      _log(LogLevel.warn, 'stopAdvertising: $e');
     }
-
     _log(LogLevel.info, 'stopped');
   }
 
-  // --------------------------------------------------------------------- send
+  Future<void> _authorize() async {
+    for (final m in [_central, _peripheral]) {
+      if (m.state == BluetoothLowEnergyState.unauthorized &&
+          Platform.isAndroid) {
+        final granted = await m.authorize();
+        _log(
+          granted ? LogLevel.info : LogLevel.warn,
+          'authorize -> $granted',
+        );
+      }
+    }
+  }
 
-  /// Sends [text] to every connected peer.
+  // -------------------------------------------------------------------- send
+
+  /// Broadcasts to every connected peer, in whichever direction that peer sits.
+  /// Sends to every distinct peer exactly once.
   ///
-  /// Two different paths, because the direction decides the mechanism. To a
-  /// peer we dialled we are the central, so we write to its RX. To a peer that
-  /// dialled us we are the peripheral, so we notify on our own TX.
+  /// Iterating legs would double-send to any peer we hold two legs to, so this
+  /// iterates *peers* and picks one leg each -- outbound by preference, since a
+  /// write is acknowledged and a notify is not.
   Future<void> send(String text) async {
-    final bytes = Uint8List.fromList(utf8.encode(text));
+    final frame = Frame.text(text);
+    _markSeen(frame.msgId);
+    final bytes = frame.encode();
+    final targets = _sendTargets();
     _log(
       LogLevel.tx,
-      'send ${bytes.length}B to ${_links.length + _notifyLimit.length} peer(s)',
+      'send ${frame.shortId} ${bytes.length}B to ${targets.length} peer(s)',
     );
+    for (final t in targets) {
+      await _sendOn(t, bytes, 'send');
+    }
+  }
 
-    for (final link in _links.values.toList()) {
-      if (bytes.length > link.maxWrite) {
-        final peer = _short('${link.peripheral.uuid}');
-        _log(LogLevel.warn, 'too long for $peer');
-        continue;
+  /// One leg per distinct peer. Legs whose peer has not said hello yet are
+  /// included on their own: a peer mid-handshake is still worth talking to.
+  List<_Target> _sendTargets() {
+    final byPeer = <String, _Target>{};
+    final anonymous = <_Target>[];
+
+    for (final e in _links.entries) {
+      if (_isBlockedKey(e.key)) continue;
+      final t = _Target.outbound(e.key, e.value);
+      final id = _outPeerId[e.key];
+      if (id == null) {
+        anonymous.add(t);
+      } else {
+        byPeer[id] = t; // outbound wins over inbound
       }
-      try {
+    }
+    for (final e in _notifyLimit.entries) {
+      if (_isBlockedKey(e.key)) continue;
+      final central = _centrals[e.key];
+      if (central == null) continue;
+      final t = _Target.inbound(e.key, central, e.value);
+      final id = _inPeerId[e.key];
+      if (id == null) {
+        anonymous.add(t);
+      } else {
+        byPeer.putIfAbsent(id, () => t);
+      }
+    }
+    return [...byPeer.values, ...anonymous];
+  }
+
+  Future<void> _sendOn(_Target t, Uint8List bytes, String what) async {
+    if (bytes.length > t.maxLength) {
+      _log(
+        LogLevel.warn,
+        '$what ${bytes.length}B exceeds ${t.maxLength}B for '
+        '${_label(t.key)} -- needs fragmentation',
+      );
+      return;
+    }
+    try {
+      final link = t.link;
+      if (link != null) {
         await _central.writeCharacteristic(
           link.peripheral,
           link.rx,
           value: bytes,
           type: GATTCharacteristicWriteType.withResponse,
         );
-      } catch (e) {
-        // TODO (Part 4): clip this to the first line. A Java stack trace in a
-        // small log pane buries the one line that matters.
-        _log(LogLevel.error, 'write failed: $e');
+        return;
       }
-    }
-
-    final tx = _myTx;
-    if (tx == null) return;
-    for (final entry in _notifyLimit.entries.toList()) {
-      final central = _centrals[entry.key];
-      if (central == null) continue;
-      if (bytes.length > entry.value) {
-        _log(LogLevel.warn, 'too long for ${_short(entry.key)}');
-        continue;
-      }
-      try {
-        await _peripheral.notifyCharacteristic(central, tx, value: bytes);
-      } catch (e) {
-        _log(LogLevel.error, 'notify failed: $e');
-      }
+      final tx = _myTx;
+      final central = t.central;
+      if (tx == null || central == null) return;
+      await _peripheral.notifyCharacteristic(central, tx, value: bytes);
+    } catch (e) {
+      _log(LogLevel.error, '$what to ${_label(t.key)}: ${_brief(e)}');
     }
   }
 
-  void _receive(Uint8List bytes, String via, String key) {
-    final text = utf8.decode(bytes, allowMalformed: true);
-    _log(LogLevel.rx, 'recv ${bytes.length}B via $via');
-    if (_messages.isClosed) return;
-    _messages.add(
-      InboundMessage(text: text, peer: _short(key), via: via),
+  void _handleInbound(Uint8List bytes, String via, String key) {
+    // A blocked peer is treated as unreachable in both directions. Accepting
+    // its frames while refusing to send would not be a partition.
+    if (_isBlockedKey(key)) return;
+
+    final peer = _label(key);
+    final frame = Frame.decode(bytes);
+    if (frame == null) {
+      _log(LogLevel.warn, 'undecodable ${bytes.length}B from $peer');
+      return;
+    }
+
+    // Hellos are per-link, not mesh traffic: they are never deduped, never
+    // relayed, and never shown as messages.
+    if (frame.isHello) {
+      final peerId = frame.text;
+      if (via == 'notify') {
+        _outPeerId[key] = peerId;
+      } else {
+        _inPeerId[key] = peerId;
+      }
+      _cancelPrune(key);
+      if (_blocked.contains(peerId)) {
+        _log(LogLevel.warn, 'hello from blocked $peerId -- dropping leg');
+        if (via == 'notify') {
+          _outPeerId[key] = peerId;
+        } else {
+          _inPeerId[key] = peerId;
+        }
+        _dropPeer(peerId);
+        return;
+      }
+      _log(LogLevel.info, 'hello from $peerId via $via');
+
+      // Answer on the same leg. Relying on the peer's subscribe event to
+      // trigger their hello leaves a leg unidentified whenever that event
+      // races or their notify fails -- and one unidentified leg is enough to
+      // stop _resolveDuplicateLink acting, which is how a pair ends up
+      // permanently double-linked.
+      if (!_helloSent.contains(key)) {
+        if (via == 'notify') {
+          final link = _links[key];
+          if (link != null) unawaited(_sendHelloOutbound(link));
+        } else {
+          final central = _centrals[key];
+          if (central != null) unawaited(_sendHelloInbound(central));
+        }
+      }
+
+      _resolveDuplicateLink(peerId);
+      return;
+    }
+
+    if (!_markSeen(frame.msgId)) {
+      // A duplicate is not just noise: if we are still holding this frame for
+      // relay, someone else has already broadcast it, which is exactly the
+      // evidence needed to decide our own relay would be redundant.
+      final pending = _pendingRelays[frame.msgId];
+      if (pending != null) {
+        pending.heardFromOthers++;
+        _log(
+          LogLevel.info,
+          'dup ${frame.shortId} -- heard ${pending.heardFromOthers}x '
+          'while queued',
+        );
+      } else {
+        _log(LogLevel.info, 'dup ${frame.shortId} dropped');
+      }
+      return;
+    }
+    if (frame.envelopeVer != Frame.envelopeVersion) {
+      _log(
+        LogLevel.warn,
+        'envelope v${frame.envelopeVer} unknown -- frozen fields still parsed, '
+        'would relay',
+      );
+    }
+    _log(
+      LogLevel.rx,
+      'recv ${frame.shortId} ${bytes.length}B via $via from $peer',
+    );
+
+    // Forward before rendering, and regardless of whether we can read it.
+    _scheduleRelay(bytes, key, frame);
+
+    // Relay-but-do-not-render. A node that cannot interpret a payload must
+    // still forward it, but it must not show it to the user -- displaying an
+    // opaque blob as if it were a message is how a stale build turns another
+    // node's protocol traffic into visible noise.
+    if (!frame.isReadableText) {
+      _log(
+        LogLevel.warn,
+        'inner v${frame.innerVer} type ${frame.type} unknown '
+        '-- relayable, not rendered',
+      );
+      return;
+    }
+    if (!_messages.isClosed) {
+      _messages.add(InboundMessage(frame: frame, via: via, peer: peer));
+    }
+  }
+
+  // ------------------------------------------------------------------- relay
+
+  /// Forwards a frame one hop, to every peer except the one it came from.
+  ///
+  /// Deliberately independent of whether we could read the payload: the whole
+  /// reason the envelope is split is so a node can carry traffic it does not
+  /// understand. Loop prevention is the dedup cache, which has already accepted
+  /// this msgId by the time we get here, so a frame can never come back around.
+  /// Queues a relay behind a random assessment delay, then relays only if no
+  /// other node beat us to it. This is the counter-based scheme from the
+  /// broadcast-storm literature, and it is closed-loop: the decision is made
+  /// from what we actually heard, not from a guess about network size.
+  ///
+  /// The alternative -- relay with probability p derived from an estimated peer
+  /// count, which is what bitchat does -- is open-loop. It cannot tell a node
+  /// with five redundant neighbours from a bridge node that is the only path,
+  /// so at p<1 it will eventually drop a frame that nobody else can carry and
+  /// nothing detects the hole. Counting duplicates cannot make that mistake: a
+  /// bridge hears no one else, so it always relays.
+  void _scheduleRelay(Uint8List bytes, String fromKey, Frame frame) {
+    final forward = Frame.forwarded(bytes);
+    if (forward == null) {
+      _log(LogLevel.info, 'ttl exhausted for ${frame.shortId} -- not relayed');
+      return;
+    }
+
+    final delayMs = _radMinMs + _rnd.nextInt(_radSpreadMs);
+    final pending = _PendingRelay(forward: forward, fromKey: fromKey);
+    _pendingRelays[frame.msgId] = pending;
+    pending.timer = Timer(Duration(milliseconds: delayMs), () {
+      _pendingRelays.remove(frame.msgId);
+      if (pending.heardFromOthers >= _suppressAfterHeard) {
+        _suppressed++;
+        _log(
+          LogLevel.info,
+          'suppressed relay of ${frame.shortId} -- heard it '
+          '${pending.heardFromOthers}x from others',
+        );
+        return;
+      }
+      _relay(pending.forward, pending.fromKey, frame);
+    });
+    _log(
+      LogLevel.info,
+      'relay of ${frame.shortId} queued ${delayMs}ms (assessment delay)',
     );
   }
 
-  // -------------------------------------------------------- peripheral wiring
+  void _relay(Uint8List forward, String fromKey, Frame frame) {
+    // Exclude the sender by node id, not just transport key: on iOS the two
+    // legs to one device carry unrelated identifiers, so keying alone would
+    // hand the frame straight back to whoever sent it.
+    final fromId = _outPeerId[fromKey] ?? _inPeerId[fromKey];
+    final targets = _sendTargets()
+        .where(
+          (t) =>
+              t.key != fromKey &&
+              (fromId == null ||
+                  (_outPeerId[t.key] != fromId && _inPeerId[t.key] != fromId)),
+        )
+        .toList();
+
+    if (targets.isEmpty) {
+      _log(LogLevel.info, 'nowhere to relay ${frame.shortId}');
+      return;
+    }
+    _relayed++;
+    _log(
+      LogLevel.tx,
+      'relay ${frame.shortId} ttl ${frame.ttl}->${frame.ttl - 1} '
+      'to ${targets.length} peer(s)',
+    );
+    for (final t in targets) {
+      _sendOn(t, forward, 'relay');
+    }
+  }
+
+  // ------------------------------------------------------------ subscriptions
+
+  /// Subscribes to a stream that may not exist on this platform.
+  ///
+  /// The platform interface declares every stream unconditionally, but the
+  /// darwin implementation makes several of them *throw UnsupportedError from
+  /// the getter itself*. Touching one during construction takes down the first
+  /// frame, which in a release build shows up as a blank grey screen with no
+  /// hint as to why. So the getter access happens in here, behind a catch, and
+  /// an absent stream degrades to a log line.
+  void _safeListen<T>(
+    Stream<T> Function() stream,
+    void Function(T) onData, {
+    required String label,
+  }) {
+    try {
+      _subs.add(stream().listen(onData));
+    } on UnsupportedError {
+      _log(LogLevel.info, '$label not available on this platform');
+    } catch (e) {
+      _log(LogLevel.warn, '$label subscribe failed: ${_brief(e)}');
+    }
+  }
 
   void _wirePeripheral() {
-    // TODO (Part 4): guard every one of these subscriptions. Some of these
-    // streams do not exist on every platform, and touching one that does not
-    // takes the whole app down before it draws a single frame.
-    _subs.add(
-      _peripheral.stateChanged.listen((e) {
-        _log(LogLevel.info, 'peripheral adapter ${e.state.name}');
-      }),
+    _safeListen(
+      () => _peripheral.stateChanged,
+      (e) => _log(LogLevel.info, 'peripheral adapter ${e.state.name}'),
+      label: 'peripheral.stateChanged',
     );
 
-    _subs.add(
-      _peripheral.characteristicNotifyStateChanged.listen((e) async {
+    // Android only. Darwin has no peripheral-side connection events at all, and
+    // no way to enumerate connected centrals either, so the registry below is
+    // driven by events that actually carry a Central. This is the extra signal,
+    // never the source of truth.
+    _safeListen(
+      () => _peripheral.connectionStateChanged,
+      (e) {
+        final key = '${e.central.uuid}';
+        if (e.state == ConnectionState.connected) {
+          _centrals[key] = e.central;
+          _log(LogLevel.info, 'central ${_short(key)} connected to us');
+        } else {
+          _cancelPrune(key);
+          _centrals.remove(key);
+          _notifyLimit.remove(key);
+          _helloSent.remove(key);
+          final goneId = _inPeerId.remove(key);
+          _log(LogLevel.info, 'central ${goneId ?? _short(key)} gone');
+          if (goneId != null) _unsuppress(goneId);
+        }
+      },
+      label: 'peripheral.connectionStateChanged',
+    );
+
+    // Supported everywhere, and the real source of truth for "a central exists
+    // and we can notify it".
+    _safeListen(
+      () => _peripheral.characteristicNotifyStateChanged,
+      (e) async {
         if (e.characteristic.uuid != _txUuid) return;
         final key = '${e.central.uuid}';
         if (e.state) {
           _centrals[key] = e.central;
-          final limit = await _peripheral.getMaximumNotifyLength(e.central);
-          _notifyLimit[key] = limit;
-          _log(LogLevel.info, 'central ${_short(key)} subscribed, ${limit}B');
+          try {
+            final limit = await _peripheral.getMaximumNotifyLength(e.central);
+            _notifyLimit[key] = limit;
+            _log(
+              LogLevel.info,
+              'central ${_short(key)} subscribed, notify limit ${limit}B',
+            );
+            await _sendHelloInbound(e.central);
+            _scheduleUnidentifiedPrune(key);
+          } catch (err) {
+            _notifyLimit[key] = 20;
+            _log(LogLevel.warn, 'notify limit unknown ($err), assuming 20B');
+          }
         } else {
-          _centrals.remove(key);
+          _cancelPrune(key);
           _notifyLimit.remove(key);
-          _log(LogLevel.info, 'central ${_short(key)} unsubscribed');
+          _centrals.remove(key);
+          _helloSent.remove(key);
+          final goneId = _inPeerId.remove(key);
+          _log(LogLevel.info, 'central ${goneId ?? _short(key)} unsubscribed');
+          if (goneId != null) _unsuppress(goneId);
         }
-      }),
+      },
+      label: 'peripheral.characteristicNotifyStateChanged',
     );
 
-    _subs.add(
-      _peripheral.characteristicWriteRequested.listen((e) async {
-        // Answer first. A write request that is left unanswered blocks the
-        // sender's queue, and a blocked queue looks exactly like a dead link.
+    _safeListen(
+      () => _peripheral.characteristicWriteRequested,
+      (e) async {
+        // Respond first. A stalled ATT response blocks the peer's queue and
+        // looks exactly like a dead link.
         try {
           await _peripheral.respondWriteRequest(e.request);
         } catch (err) {
-          _log(LogLevel.error, 'respond failed: $err');
+          _log(LogLevel.error, 'respondWriteRequest: $err');
         }
         if (e.characteristic.uuid != _rxUuid) return;
-        _receive(e.request.value, 'write', '${e.central.uuid}');
-      }),
+        // A central that writes is a central we know about, whether or not we
+        // ever saw a connection event for it.
+        _centrals.putIfAbsent('${e.central.uuid}', () => e.central);
+        _handleInbound(e.request.value, 'write', '${e.central.uuid}');
+      },
+      label: 'peripheral.characteristicWriteRequested',
+    );
+
+    _safeListen(
+      () => _peripheral.characteristicReadRequested,
+      (e) async {
+        try {
+          await _peripheral.respondReadRequestWithValue(
+            e.request,
+            value: Uint8List(0),
+          );
+        } catch (err) {
+          _log(LogLevel.error, 'respondReadRequest: $err');
+        }
+      },
+      label: 'peripheral.characteristicReadRequested',
+    );
+
+    // Android only. The numbers that actually matter come from
+    // getMaximumNotifyLength / getMaximumWriteLength, which work everywhere.
+    _safeListen(
+      () => _peripheral.mtuChanged,
+      (e) => _log(
+        LogLevel.info,
+        'mtu ${e.mtu} with central ${_short('${e.central.uuid}')}',
+      ),
+      label: 'peripheral.mtuChanged',
     );
   }
 
   // ----------------------------------------------------------- central wiring
 
   void _wireCentral() {
-    _subs.add(
-      _central.stateChanged.listen((e) {
+    _safeListen(
+      () => _central.stateChanged,
+      (e) {
         _log(LogLevel.info, 'central adapter ${e.state.name}');
-      }),
-    );
-
-    _subs.add(
-      _central.discovered.listen((e) async {
-        final key = '${e.peripheral.uuid}';
-        if (_links.containsKey(key) || _dialling.contains(key)) return;
-        _dialling.add(key);
-        _log(LogLevel.info, 'dialling ${_short(key)} (rssi ${e.rssi})');
-        try {
-          await _central.connect(e.peripheral);
-        } catch (err) {
-          _dialling.remove(key);
-          _log(LogLevel.error, 'connect failed: $err');
+        if (e.state == BluetoothLowEnergyState.poweredOn &&
+            _wantRunning &&
+            !_running) {
+          _log(LogLevel.info, 'adapter came up -- starting');
+          _startStack();
+        } else if (e.state != BluetoothLowEnergyState.poweredOn && _running) {
+          // The links are gone with the radio; do not keep claiming to run.
+          _running = false;
+          _links.clear();
+          _dialling.clear();
+          _centrals.clear();
+          _notifyLimit.clear();
+          _outPeerId.clear();
+          _inPeerId.clear();
+          _log(LogLevel.warn, 'adapter ${e.state.name} -- stack torn down');
         }
-      }),
+      },
+      label: 'central.stateChanged',
     );
 
-    _subs.add(
-      _central.connectionStateChanged.listen((e) async {
+    _safeListen(
+      () => _central.discovered,
+      _onDiscovered,
+      label: 'central.discovered',
+    );
+
+    _safeListen(
+      () => _central.connectionStateChanged,
+      (e) async {
         final key = '${e.peripheral.uuid}';
         if (e.state == ConnectionState.connected) {
+          _connected.add(key);
           await _setUpOutbound(e.peripheral);
         } else {
+          _connected.remove(key);
+          final wasYielded = _yieldedKeys.contains(key);
+          final lived = _links[key] == null
+              ? null
+              : DateTime.now().difference(_links[key]!.connectedAt);
+          if (!wasYielded && lived != null && lived < _flapWindow) {
+            final n = (_flaps[key] ?? 0) + 1;
+            _flaps[key] = n;
+            final wait = Duration(seconds: 1 << (n > 5 ? 5 : n));
+            final capped = wait > _backoffCap ? _backoffCap : wait;
+            _backoffUntil[key] = DateTime.now().add(capped);
+            _log(
+              LogLevel.warn,
+              'link to ${_label(key)} lasted ${lived.inMilliseconds}ms '
+              '(flap $n) -- backing off ${capped.inSeconds}s',
+            );
+          } else if (lived != null && lived >= _flapWindow) {
+            _flaps.remove(key);
+            _backoffUntil.remove(key);
+          }
+          _helloSent.remove(key);
           _links.remove(key);
-          _dialling.remove(key);
-          _log(LogLevel.info, 'peer ${_short(key)} disconnected');
+          _outPeerId.remove(key);
+          if (wasYielded) {
+            // Our own dedupe hang-up. Keep the key in _dialling so discovery
+            // leaves it alone; the peer's inbound leg carries the traffic.
+            _log(LogLevel.info, 'peer ${_short(key)} released (deduped)');
+          } else {
+            _dialling.remove(key);
+            _log(LogLevel.info, 'peer ${_short(key)} disconnected');
+          }
         }
-      }),
+      },
+      label: 'central.connectionStateChanged',
     );
 
-    _subs.add(
-      _central.characteristicNotified.listen((e) {
+    _safeListen(
+      () => _central.characteristicNotified,
+      (e) {
         if (e.characteristic.uuid != _txUuid) return;
-        _receive(e.value, 'notify', '${e.peripheral.uuid}');
-      }),
+        _handleInbound(e.value, 'notify', '${e.peripheral.uuid}');
+      },
+      label: 'central.characteristicNotified',
+    );
+
+    // Android only, same reasoning as above.
+    _safeListen(
+      () => _central.mtuChanged,
+      (e) => _log(
+        LogLevel.info,
+        'mtu ${e.mtu} with peer ${_short('${e.peripheral.uuid}')}',
+      ),
+      label: 'central.mtuChanged',
     );
   }
 
-  /// Finds our service on a freshly connected peer, subscribes to its TX so it
-  /// can talk to us, and reads the real write limit for this connection.
+  Future<void> _onDiscovered(DiscoveredEventArgs e) async {
+    final key = '${e.peripheral.uuid}';
+
+    String? advertisedName;
+    try {
+      advertisedName = e.advertisement.name;
+    } catch (_) {
+      advertisedName = null; // getter throws on unsupported platforms
+    }
+
+    // Record every sighting, before any decision about dialling. This is what
+    // makes "C never appeared" an observation rather than an inference.
+    final seen = _observed[key];
+    if (seen == null) {
+      _observed[key] = ObservedPeer(
+        key: key,
+        name: advertisedName,
+        rssi: e.rssi,
+      );
+    } else {
+      seen.rssi = e.rssi;
+      seen.lastSeen = DateTime.now();
+    }
+
+    // A blocked peer stays visible on the radio -- that is the point, it is
+    // "out of range" only as far as the protocol is concerned.
+    if (advertisedName != null && advertisedName.startsWith(kNamePrefix)) {
+      final id = advertisedName.substring(kNamePrefix.length);
+      if (_blocked.contains(id)) return;
+    }
+
+    if (_links.containsKey(key) || _dialling.contains(key)) return;
+
+    final until = _backoffUntil[key];
+    if (until != null && DateTime.now().isBefore(until)) return;
+
+    // No tie-break on the advertised name. Android cannot advertise an
+    // arbitrary local name at all -- AdvertiseData only has
+    // setIncludeDeviceName(bool) -- so the name is the phone's adapter name
+    // there and our prefix never matches. Both sides therefore dial, and the
+    // in-band hello tears the redundant link down deterministically. Uniform
+    // across platforms beats a tie-break that silently works on one of them.
+    final peerName = advertisedName;
+
+    _dialling.add(key);
+    _log(
+      LogLevel.info,
+      'dialling ${peerName ?? _short(key)} (rssi ${e.rssi})',
+    );
+    try {
+      await _central.connect(e.peripheral);
+    } catch (err) {
+      _dialling.remove(key);
+      _log(LogLevel.error, 'connect ${_short(key)}: ${_brief(err)}');
+    }
+  }
+
+  // ------------------------------------------------------------------- hello
+
+  Future<void> _sendHelloOutbound(_OutboundLink link) async {
+    _helloSent.add('${link.peripheral.uuid}');
+    try {
+      await _central.writeCharacteristic(
+        link.peripheral,
+        link.rx,
+        value: Frame.hello(nodeId).encode(),
+        type: GATTCharacteristicWriteType.withResponse,
+      );
+    } catch (e) {
+      _log(LogLevel.warn, 'hello write failed: ${_brief(e)}');
+    }
+  }
+
+  Future<void> _sendHelloInbound(Central central) async {
+    final tx = _myTx;
+    if (tx == null) return;
+    _helloSent.add('${central.uuid}');
+    try {
+      await _peripheral.notifyCharacteristic(
+        central,
+        tx,
+        value: Frame.hello(nodeId).encode(),
+      );
+    } catch (e) {
+      _log(LogLevel.warn, 'hello notify failed: ${_brief(e)}');
+    }
+  }
+
+  /// The inbound leg we kept has gone away, so this peer is no longer reachable
+  /// at all. Lift the dial suppression that _resolveDuplicateLink put in place,
+  /// or we would never reconnect to it.
+  void _unsuppress(String peerId) {
+    if (!_yieldedTo.remove(peerId)) return;
+    _yieldedKeys.removeWhere((k) {
+      _dialling.remove(k);
+      return true;
+    });
+    _log(LogLevel.info, '$peerId gone -- dialling re-armed');
+  }
+
+  /// A central that subscribes but never sends a hello is a leftover: either a
+  /// half-dead connection or a peer that went away mid-handshake. Drop it so
+  /// the peer count means something.
+  void _scheduleUnidentifiedPrune(String key) {
+    _pruneTimers.remove(key)?.cancel();
+    _pruneTimers[key] = Timer(const Duration(seconds: 8), () {
+      _pruneTimers.remove(key);
+      if (!_centrals.containsKey(key)) return;
+      if (_inPeerId.containsKey(key)) return; // identified itself, keep it
+      _centrals.remove(key);
+      _notifyLimit.remove(key);
+      _log(LogLevel.warn, 'central ${_short(key)} never said hello -- pruned');
+    });
+  }
+
+  void _cancelPrune(String key) => _pruneTimers.remove(key)?.cancel();
+
+  /// Notes that a peer is reachable on more than one leg. Deliberately does
+  /// *not* disconnect anything.
+  ///
+  /// Tearing a leg down looked right and was wrong: on Android both GATT roles
+  /// for one remote report under a single MAC-derived key, so hanging up "our
+  /// outbound" is indistinguishable from the peer hanging up its inbound, and
+  /// the platform took the surviving leg with it. Against iOS that produced an
+  /// endless dial / hello / drop / redial loop.
+  ///
+  /// Redundant legs cost a connection slot, but duplicate *delivery* is already
+  /// handled: sending picks one leg per peer and the dedup cache catches
+  /// anything that still arrives twice. Cheap, and it does not fight the
+  /// platform over who owns a connection.
+  void _resolveDuplicateLink(String peerId) {
+    var legs = 0;
+    for (final v in _outPeerId.values) {
+      if (v == peerId) legs++;
+    }
+    for (final v in _inPeerId.values) {
+      if (v == peerId) legs++;
+    }
+    if (legs > 1) {
+      _log(
+        LogLevel.info,
+        '$peerId reachable on $legs legs -- sending on one',
+      );
+    }
+  }
+
+  GATTService? _findMeshService(List<GATTService> services) {
+    for (final s in services) {
+      if (s.uuid == _serviceUuid) return s;
+    }
+    return null;
+  }
+
   Future<void> _setUpOutbound(Peripheral peripheral) async {
     final key = '${peripheral.uuid}';
     try {
@@ -398,17 +1163,39 @@ class MeshLink {
           final mtu = await _central.requestMTU(peripheral, mtu: 517);
           _log(LogLevel.info, 'negotiated mtu $mtu');
         } catch (err) {
-          _log(LogLevel.warn, 'requestMTU: $err');
+          _log(LogLevel.warn, 'requestMTU: ${_brief(err)}');
         }
       }
 
-      final services = await _central.discoverGATT(peripheral);
-      GATTService? service;
-      for (final s in services) {
-        if (s.uuid == _serviceUuid) service = s;
+      if (!_connected.contains(key)) return;
+
+      // A freshly connected Android peer sometimes reports zero services, then
+      // reports them correctly a moment later. One retry turns that from a lost
+      // link into a slower one.
+      var services = await _central.discoverGATT(peripheral);
+      var service = _findMeshService(services);
+      if (service == null) {
+        _log(
+          LogLevel.warn,
+          'no mesh service in ${services.length} services -- retrying discovery',
+        );
+        await Future<void>.delayed(const Duration(milliseconds: 600));
+        services = await _central.discoverGATT(peripheral);
+        service = _findMeshService(services);
+      }
+      if (!_connected.contains(key)) {
+        _log(LogLevel.info, 'peer ${_short(key)} vanished during discovery');
+        _dialling.remove(key);
+        return;
       }
       if (service == null) {
-        _log(LogLevel.error, 'no mesh service on ${_short(key)}');
+        _log(
+          LogLevel.error,
+          'peer ${_short(key)} has no mesh service '
+          '(found ${services.length} services) -- disconnecting',
+        );
+        // Re-arm discovery: this peer may simply have been mid-setup, and
+        // leaving the key in _dialling would blacklist it for the whole run.
         _dialling.remove(key);
         await _central.disconnect(peripheral);
         return;
@@ -421,37 +1208,70 @@ class MeshLink {
         if (c.uuid == _rxUuid) rx = c;
       }
       if (tx == null || rx == null) {
-        _log(LogLevel.error, 'characteristics missing on ${_short(key)}');
+        _log(
+            LogLevel.error, 'peer ${_short(key)} missing tx/rx characteristic');
         _dialling.remove(key);
         await _central.disconnect(peripheral);
         return;
       }
 
+      // Register BEFORE subscribing. Subscribing is what makes the peer notify
+      // its hello, and that hello can arrive before this method resumes -- in
+      // which case _resolveDuplicateLink would remove a link that this method
+      // then puts straight back, leaving the pair permanently double-linked.
+      // A conservative 20B write limit holds until the real one is known.
+      final link = _OutboundLink(
+        peripheral: peripheral,
+        tx: tx,
+        rx: rx,
+        maxWrite: 20,
+      );
+      _links[key] = link;
+
+      if (!_connected.contains(key)) {
+        _links.remove(key);
+        _dialling.remove(key);
+        _log(LogLevel.info, 'peer ${_short(key)} vanished before subscribe');
+        return;
+      }
       await _central.setCharacteristicNotifyState(peripheral, tx, state: true);
 
-      var maxWrite = 20;
       try {
-        maxWrite = await _central.getMaximumWriteLength(
+        link.maxWrite = await _central.getMaximumWriteLength(
           peripheral,
           type: GATTCharacteristicWriteType.withResponse,
         );
       } catch (err) {
-        _log(LogLevel.warn, 'write limit unknown, assuming 20B');
+        _log(LogLevel.warn,
+            'write limit unknown (${_brief(err)}), assuming 20B');
       }
 
-      _links[key] = _OutboundLink(
-        peripheral: peripheral,
-        rx: rx,
-        maxWrite: maxWrite,
+      // The dedupe may have released this link while we were awaiting above.
+      if (!_links.containsKey(key)) {
+        _log(LogLevel.info, 'peer ${_short(key)} released during setup');
+        return;
+      }
+      _log(
+        LogLevel.info,
+        'peer ${_short(key)} ready, subscribed, '
+        'write limit ${link.maxWrite}B',
       );
-      _log(LogLevel.info, 'peer ${_short(key)} ready, ${maxWrite}B');
+      await _sendHelloOutbound(link);
     } catch (err) {
-      _dialling.remove(key);
-      _log(LogLevel.error, 'setup failed: $err');
+      _log(LogLevel.error, 'setup ${_short(key)}: ${_brief(err)}');
+      if (!_yieldedKeys.contains(key)) _dialling.remove(key);
     }
   }
 
   Future<void> dispose() async {
+    for (final r in _pendingRelays.values) {
+      r.timer?.cancel();
+    }
+    _pendingRelays.clear();
+    for (final t in _pruneTimers.values) {
+      t.cancel();
+    }
+    _pruneTimers.clear();
     for (final s in _subs) {
       await s.cancel();
     }
@@ -459,4 +1279,50 @@ class MeshLink {
     await _logs.close();
     await _messages.close();
   }
+}
+
+/// A peer the radio can see right now, linked or not.
+class ObservedPeer {
+  ObservedPeer({required this.key, required this.name, required this.rssi})
+      : lastSeen = DateTime.now();
+
+  final String key;
+  final String? name;
+  int rssi;
+  DateTime lastSeen;
+
+  /// Advertised name if we got one, otherwise the tail of the transport key.
+  /// Android cannot advertise a custom name, so this is often the adapter name.
+  String get label =>
+      name ?? (key.length <= 8 ? key : key.substring(key.length - 8));
+
+  Duration get age => DateTime.now().difference(lastSeen);
+}
+
+/// One chosen way to reach one peer: an outbound link we write to, or an
+/// inbound central we notify.
+class _Target {
+  _Target.outbound(this.key, _OutboundLink this.link)
+      : central = null,
+        maxLength = link.maxWrite;
+
+  _Target.inbound(this.key, Central this.central, this.maxLength) : link = null;
+
+  final String key;
+  final _OutboundLink? link;
+  final Central? central;
+  final int maxLength;
+}
+
+/// A relay held back during its random assessment delay.
+class _PendingRelay {
+  _PendingRelay({required this.forward, required this.fromKey});
+
+  final Uint8List forward;
+  final String fromKey;
+
+  /// How many times this frame arrived from someone else while we waited. Each
+  /// one is evidence that our own rebroadcast would be redundant.
+  int heardFromOthers = 0;
+  Timer? timer;
 }

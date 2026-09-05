@@ -1,16 +1,22 @@
 import 'dart:async';
 
+import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'package:flutter/material.dart';
 
+import '../ble/frame.dart';
+import '../ble/link_ids.dart';
 import '../ble/mesh_link.dart';
 
-/// One bubble in the chat list.
 class ChatEntry {
-  ChatEntry({required this.text, required this.mine, required this.detail});
-
+  ChatEntry({
+    required this.text,
+    required this.mine,
+    required this.detail,
+  }) : time = DateTime.now();
   final String text;
   final bool mine;
   final String detail;
+  final DateTime time;
 }
 
 class HomePage extends StatefulWidget {
@@ -23,19 +29,22 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final _link = MeshLink();
   final _input = TextEditingController();
-  final _logScroll = ScrollController();
   final _logs = <LogLine>[];
   final _chat = <ChatEntry>[];
-
-  late final StreamSubscription<LogLine> _logSub;
-  late final StreamSubscription<InboundMessage> _msgSub;
+  final _logScroll = ScrollController();
+  late final StreamSubscription _logSub;
+  late final StreamSubscription _msgSub;
+  Timer? _tick;
   bool _busy = false;
 
   @override
   void initState() {
     super.initState();
-    _logs.addAll(_link.history);
-
+    _logs.addAll(_link.history); // replay what happened before we subscribed
+    // RSSI and "last seen" only mean something if they move.
+    _tick = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {});
+    });
     _logSub = _link.logs.listen((line) {
       setState(() {
         _logs.add(line);
@@ -47,14 +56,19 @@ class _HomePageState extends State<HomePage> {
         }
       });
     });
-
     _msgSub = _link.messages.listen((msg) {
       setState(() {
         _chat.add(
           ChatEntry(
-            text: msg.text,
+            // MeshLink only surfaces frames it can render now; unknown
+            // types are logged and relayed, never shown.
+            text: msg.frame.text,
             mine: false,
-            detail: '${msg.via} · ${msg.peer}',
+            detail: () {
+              final hops = Frame.defaultTtl - msg.frame.ttl;
+              final path = hops <= 0 ? 'direct' : '$hops hop';
+              return '${msg.via} · ${msg.peer} · $path · ttl ${msg.frame.ttl}';
+            }(),
           ),
         );
       });
@@ -63,6 +77,7 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
+    _tick?.cancel();
     _logSub.cancel();
     _msgSub.cancel();
     _link.dispose();
@@ -74,13 +89,13 @@ class _HomePageState extends State<HomePage> {
   Future<void> _toggle() async {
     setState(() => _busy = true);
     try {
-      if (_link.running) {
+      if (_link.running || _link.wantRunning) {
         await _link.stop();
       } else {
         await _link.start();
       }
     } catch (_) {
-      // Already logged by MeshLink. The log pane is the source of truth.
+      // Already logged by MeshLink; the log pane is the source of truth.
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -95,7 +110,8 @@ class _HomePageState extends State<HomePage> {
         ChatEntry(
           text: text,
           mine: true,
-          detail: '${_link.outboundPeers + _link.inboundPeers} peer(s)',
+          detail: '${_link.outboundPeers} out · '
+              '${_link.subscribedCentrals} sub',
         ),
       );
     });
@@ -103,7 +119,93 @@ class _HomePageState extends State<HomePage> {
     if (mounted) setState(() {});
   }
 
-  Color _logColour(LogLevel level, ColorScheme scheme) => switch (level) {
+  /// Blocking a peer is how an A-B-C line topology is made on one desk: the
+  /// radio still sees it, the protocol pretends it cannot.
+  Future<void> _openBlockSheet() async {
+    final input = TextEditingController();
+    await showDialog<void>(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setSheet) {
+          final candidates = <String>{
+            ..._link.knownPeers,
+            ..._link.blocked,
+          }.toList()
+            ..sort();
+          return AlertDialog(
+            title: const Text('Simulate out of range'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'A blocked peer is ignored in both directions, so you can '
+                    'build an A-B-C line on one table.',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                  const SizedBox(height: 12),
+                  if (candidates.isEmpty)
+                    const Text('No peers seen yet.',
+                        style: TextStyle(fontSize: 12)),
+                  for (final id in candidates)
+                    CheckboxListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: Text(id,
+                          style: const TextStyle(fontFamily: 'monospace')),
+                      value: _link.blocked.contains(id),
+                      onChanged: (v) => setSheet(() {
+                        if (v ?? false) {
+                          _link.block(id);
+                        } else {
+                          _link.unblock(id);
+                        }
+                      }),
+                    ),
+                  const Divider(),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: input,
+                          textCapitalization: TextCapitalization.characters,
+                          decoration: const InputDecoration(
+                            isDense: true,
+                            labelText: 'node id',
+                            helperText: 'block before meeting it',
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.add),
+                        onPressed: () {
+                          final id = input.text.trim().toUpperCase();
+                          if (id.isEmpty) return;
+                          setSheet(() => _link.block(id));
+                          input.clear();
+                        },
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Done'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    input.dispose();
+    if (mounted) setState(() {});
+  }
+
+  Color _logColor(LogLevel level, ColorScheme scheme) => switch (level) {
         LogLevel.error => scheme.error,
         LogLevel.warn => Colors.orange.shade800,
         LogLevel.tx => Colors.blue.shade700,
@@ -115,54 +217,63 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final running = _link.running;
-    final peers = _link.outboundPeers + _link.inboundPeers;
+    // Start pressed while the adapter was off: intent is held and the stack
+    // comes up by itself, so the button must offer a way out.
+    final pending = _link.wantRunning && !running;
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('mesh chat · ${_link.nodeId}'),
+        title: Text('mesh spike · ${_link.nodeId}'),
         actions: [
+          IconButton(
+            tooltip: 'Simulate out of range',
+            onPressed: _openBlockSheet,
+            icon: Badge(
+              isLabelVisible: _link.blocked.isNotEmpty,
+              label: Text('${_link.blocked.length}'),
+              child: const Icon(Icons.block),
+            ),
+          ),
           Padding(
             padding: const EdgeInsets.only(right: 8),
             child: FilledButton.tonalIcon(
               onPressed: _busy ? null : _toggle,
-              icon: Icon(running ? Icons.stop : Icons.play_arrow),
-              label: Text(running ? 'Stop' : 'Start'),
+              icon: Icon(
+                running || pending ? Icons.stop : Icons.play_arrow,
+              ),
+              label: Text(
+                running
+                    ? 'Stop'
+                    : pending
+                        ? 'Waiting'
+                        : 'Start',
+              ),
             ),
           ),
         ],
       ),
       body: Column(
         children: [
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-            child: Wrap(
-              spacing: 6,
-              runSpacing: 6,
-              children: [
-                _Chip(
-                  label: 'adapter ${_link.adapterState}',
-                  ok: _link.adapterState == 'poweredOn',
-                ),
-                _Chip(
-                    label: 'out ${_link.outboundPeers}',
-                    ok: _link.outboundPeers > 0),
-                _Chip(
-                    label: 'in ${_link.inboundPeers}',
-                    ok: _link.inboundPeers > 0),
-              ],
-            ),
-          ),
+          _StatusStrip(link: _link),
           const Divider(height: 1),
           Expanded(
+            flex: 3,
             child: _chat.isEmpty
                 ? Center(
                     child: Text(
-                      running
-                          ? peers == 0
-                              ? 'Waiting for a peer.\nStart the app on '
-                                  'another phone.'
-                              : 'Linked to $peers peer(s).\nSend something.'
-                          : 'Press Start on every phone.',
+                      !running && _link.wantRunning
+                          ? (_link.state == BluetoothLowEnergyState.poweredOn
+                              ? 'Adapter is on but the stack did not come up.'
+                                  '\nSee the log below.'
+                              : 'Bluetooth is ${_link.state.name}.'
+                                  '\nTurn it on and this will start itself.')
+                          : !running
+                              ? 'Press Start on every device.'
+                              : _link.peerLabels.isEmpty
+                                  ? 'Waiting for a peer.\nStart the app on '
+                                      'another device.'
+                                  : 'Linked to ${_link.knownPeers.isEmpty ? _link.peerLabels.length : _link.knownPeers.length} peer(s).'
+                                      '\nSend something.',
                       textAlign: TextAlign.center,
                       style: TextStyle(color: scheme.onSurfaceVariant),
                     ),
@@ -254,7 +365,7 @@ class _HomePageState extends State<HomePage> {
                       fontFamily: 'monospace',
                       fontSize: 11,
                       height: 1.5,
-                      color: _logColour(l.level, scheme),
+                      color: _logColor(l.level, scheme),
                     ),
                   );
                 },
@@ -267,9 +378,91 @@ class _HomePageState extends State<HomePage> {
   }
 }
 
+class _StatusStrip extends StatelessWidget {
+  const _StatusStrip({required this.link});
+  final MeshLink link;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Wrap(
+            spacing: 6,
+            runSpacing: 6,
+            children: [
+              _Chip(
+                label: 'adapter ${link.state.name}',
+                ok: link.state.name == 'poweredOn',
+              ),
+              _Chip(
+                  label: 'out ${link.outboundPeers}',
+                  ok: link.outboundPeers > 0),
+              _Chip(
+                  label: 'in ${link.inboundPeers}', ok: link.inboundPeers > 0),
+              _Chip(
+                label: 'sub ${link.subscribedCentrals}',
+                ok: link.subscribedCentrals > 0,
+              ),
+              _Chip(
+                label: 'relay ${link.relayedCount}/'
+                    '${link.relayedCount + link.suppressedCount}',
+                ok: link.relayedCount > 0 || link.suppressedCount > 0,
+              ),
+              _Chip(label: 'env v${Frame.envelopeVersion}', ok: true),
+            ],
+          ),
+          // Radio-visible peers, linked or not. For the control experiment this
+          // is the line that matters: if C never shows up here, C is genuinely
+          // out of range, and that is an observation rather than an inference.
+          if (link.observed.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            SizedBox(
+              height: 20,
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                children: [
+                  for (final o in link.observed)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 10),
+                      child: Text(
+                        '${o.label} ${o.rssi}dBm ${o.age.inSeconds}s'
+                        '${link.blocked.contains(o.label.replaceFirst(kNamePrefix, '')) ? ' [blocked]' : ''}',
+                        style: TextStyle(
+                          fontFamily: 'monospace',
+                          fontSize: 11,
+                          color: o.age.inSeconds > 10
+                              ? scheme.outline
+                              : scheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+          if (link.peerLabels.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              link.peerLabels.join('   '),
+              style: TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 11,
+                color: scheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
 class _Chip extends StatelessWidget {
   const _Chip({required this.label, required this.ok});
-
   final String label;
   final bool ok;
 
