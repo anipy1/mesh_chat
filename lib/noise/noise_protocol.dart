@@ -91,6 +91,62 @@ class CipherState {
     return out;
   }
 
+  /// Encrypts at a caller-chosen counter, leaving our own counter alone.
+  ///
+  /// Reusing a counter under one key destroys the security of the cipher
+  /// completely, so nothing should call this directly. [NoiseTransport] owns a
+  /// counter and is the only intended caller.
+  Future<Uint8List> encryptWithAdAt(
+    int nonce,
+    List<int> ad,
+    List<int> plaintext,
+  ) async {
+    final key = _key;
+    if (key == null) throw NoiseError('transport cipher has no key');
+    final box = await _aead.encrypt(
+      plaintext,
+      secretKey: SecretKey(key),
+      nonce: _nonceBytes(nonce),
+      aad: ad,
+    );
+    final out = Uint8List(box.cipherText.length + _tagLen);
+    out.setRange(0, box.cipherText.length, box.cipherText);
+    out.setRange(box.cipherText.length, out.length, box.mac.bytes);
+    return out;
+  }
+
+  /// Decrypts at a counter the sender chose, leaving our own counter alone.
+  ///
+  /// Safe to call with an attacker-supplied nonce: a wrong one simply fails to
+  /// authenticate. Replay is a separate problem, handled by [ReplayWindow].
+  Future<Uint8List> decryptWithAdAt(
+    int nonce,
+    List<int> ad,
+    List<int> ciphertext,
+  ) async {
+    final key = _key;
+    if (key == null) throw NoiseError('transport cipher has no key');
+    if (ciphertext.length < _tagLen) {
+      throw NoiseError('ciphertext shorter than its tag');
+    }
+    final split = ciphertext.length - _tagLen;
+    final box = SecretBox(
+      ciphertext.sublist(0, split),
+      nonce: _nonceBytes(nonce),
+      mac: Mac(ciphertext.sublist(split)),
+    );
+    try {
+      final clear = await _aead.decrypt(
+        box,
+        secretKey: SecretKey(key),
+        aad: ad,
+      );
+      return Uint8List.fromList(clear);
+    } on SecretBoxAuthenticationError {
+      throw NoiseError('decryption failed');
+    }
+  }
+
   Future<Uint8List> decryptWithAd(List<int> ad, List<int> ciphertext) async {
     final key = _key;
     if (key == null) return Uint8List.fromList(ciphertext);
