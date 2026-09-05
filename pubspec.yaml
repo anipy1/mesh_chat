@@ -10,6 +10,13 @@ dependencies:
   flutter:
     sdk: flutter
   bluetooth_low_energy: ^6.2.1
+  cryptography: ^2.9.0
+  # Pinned to 9.x on purpose. 10.x and later build against compileSdk 37, and
+  # the android-37 platform this machine installed reports its api level as
+  # "37.0" rather than an integer, so Gradle cannot resolve it and the build
+  # fails inside the plugin. Nothing in our code needs the newer API. Worth
+  # retrying once the SDK ships that platform with sane metadata.
+  flutter_secure_storage: ^9.2.4
 
 dev_dependencies:
   flutter_test:

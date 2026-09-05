@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import '../ble/frame.dart';
 import '../ble/link_ids.dart';
 import '../ble/mesh_link.dart';
+import '../identity/identity_store.dart';
 
 class ChatEntry {
   ChatEntry({
@@ -20,14 +21,19 @@ class ChatEntry {
 }
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+  const HomePage({super.key, required this.loaded});
+
+  final LoadedIdentity loaded;
 
   @override
   State<HomePage> createState() => _HomePageState();
 }
 
 class _HomePageState extends State<HomePage> {
-  final _link = MeshLink();
+  late final _link = MeshLink(
+    identity: widget.loaded.identity,
+    source: widget.loaded.source,
+  );
   final _input = TextEditingController();
   final _logs = <LogLine>[];
   final _chat = <ChatEntry>[];

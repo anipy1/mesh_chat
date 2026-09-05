@@ -7,6 +7,8 @@ import 'package:flutter/foundation.dart';
 
 import 'fragment_assembler.dart';
 import 'frame.dart';
+import '../identity/identity_store.dart';
+import '../identity/node_identity.dart';
 import 'link_ids.dart';
 
 enum LogLevel { info, tx, rx, warn, error }
@@ -51,12 +53,20 @@ class _OutboundLink {
 /// way, and messages flow in both directions regardless of who dialled:
 /// central->peripheral by writing RX, peripheral->central by notifying TX.
 class MeshLink {
-  MeshLink() : nodeId = newNodeId() {
+  MeshLink({required this.identity, IdentitySource? source}) {
     _wirePeripheral();
     _wireCentral();
+    _announceIdentity(source);
   }
 
-  final String nodeId;
+  /// Who this node is. Derived from a seed that outlives the process, so the
+  /// id below is the same on every launch.
+  final NodeIdentity identity;
+
+  /// The short label that goes on the air and into logs. Four characters of
+  /// the fingerprint, not a random string, so it identifies rather than just
+  /// distinguishes.
+  String get nodeId => identity.shortId;
   final CentralManager _central = CentralManager();
   final PeripheralManager _peripheral = PeripheralManager();
 
@@ -239,6 +249,28 @@ class MeshLink {
     final list = _observed.values.toList()
       ..sort((a, b) => b.rssi.compareTo(a.rssi));
     return list;
+  }
+
+  /// Puts the identity in the log pane, which is the only place it can be read
+  /// on a phone that is not plugged into anything.
+  void _announceIdentity(IdentitySource? source) {
+    switch (source) {
+      case IdentitySource.created:
+        _log(LogLevel.info, 'new identity $nodeId created');
+      case IdentitySource.restored:
+        _log(LogLevel.info, 'identity $nodeId restored');
+      case IdentitySource.replaced:
+        // Worth shouting about: to every other node on the mesh this device
+        // just turned into a stranger.
+        _log(
+          LogLevel.warn,
+          'stored seed was unreadable -- this is a NEW identity, $nodeId',
+        );
+      case null:
+        break;
+    }
+    _log(LogLevel.info, 'peer id ${identity.peerId}');
+    _log(LogLevel.info, 'fingerprint ${identity.readableFingerprint}');
   }
 
   void block(String nodeId) {
