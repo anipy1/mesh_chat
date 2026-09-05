@@ -136,6 +136,180 @@ void main() {
     });
   });
 
+  group('directed frames', () {
+    const dest = '0123456789abcdef';
+    const src = 'fedcba9876543210';
+
+    test('a handshake step round trips', () {
+      final f = Frame.handshake(
+        dest: dest,
+        src: src,
+        step: 1,
+        body: Uint8List.fromList(List.filled(96, 7)),
+      );
+      final parsed = HandshakeMessage.parse(Frame.decode(f.encode())!)!;
+      expect(parsed.dest, dest);
+      expect(parsed.src, src);
+      expect(parsed.step, 1);
+      expect(parsed.body.length, 96);
+      expect(parsed.body.every((b) => b == 7), isTrue);
+    });
+
+    test('a sealed message round trips, counter included', () {
+      final f = Frame.sealed(
+        dest: dest,
+        src: src,
+        counter: 123456789,
+        ciphertext: Uint8List.fromList(List.filled(40, 9)),
+      );
+      final parsed = SealedEnvelope.parse(Frame.decode(f.encode())!)!;
+      expect(parsed.dest, dest);
+      expect(parsed.src, src);
+      expect(parsed.counter, 123456789);
+      expect(parsed.ciphertext.length, 40);
+    });
+
+    test('every XX step fits one frame', () {
+      // Measured at 32, 96 and 64 bytes. If a handshake ever needed
+      // fragmenting, a lost piece would stall the session rather than one
+      // message.
+      for (final size in [32, 96, 64]) {
+        final f = Frame.handshake(
+          dest: dest,
+          src: src,
+          step: 0,
+          body: Uint8List(size),
+        );
+        expect(f.encode().length, lessThanOrEqualTo(Frame.meshMtu));
+      }
+    });
+
+    test('the sealed budget is what actually fits', () {
+      final f = Frame.sealed(
+        dest: dest,
+        src: src,
+        counter: 0,
+        // Plaintext budget plus the tag the cipher adds.
+        ciphertext: Uint8List(Frame.sealedPlaintextBudget + 16),
+      );
+      expect(f.encode().length, Frame.meshMtu);
+    });
+
+    test('a directed frame is not mistaken for text or a fragment', () {
+      final f = Frame.handshake(
+        dest: dest,
+        src: src,
+        step: 0,
+        body: Uint8List(32),
+      );
+      expect(f.isReadableText, isFalse);
+      expect(f.isFragment, isFalse);
+      expect(f.isHandshake, isTrue);
+      expect(FragmentPart.parse(f), isNull);
+      expect(SealedEnvelope.parse(f), isNull);
+    });
+
+    test('the label comes out of the peer id', () {
+      // So a hello carrying an id has carried the label too.
+      final f = Frame.handshake(
+        dest: dest,
+        src: src,
+        step: 0,
+        body: Uint8List(32),
+      );
+      final parsed = HandshakeMessage.parse(f)!;
+      expect(parsed.srcLabel.length, 4);
+      expect(RegExp(r'^[A-HJ-NP-Z2-9]{4}$').hasMatch(parsed.srcLabel), isTrue);
+    });
+
+    test('a peer id that is not 16 hex characters is refused', () {
+      expect(
+        () => Frame.handshake(
+          dest: 'short',
+          src: src,
+          step: 0,
+          body: Uint8List(32),
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => Frame.sealed(
+          dest: dest,
+          src: 'zzzzzzzzzzzzzzzz',
+          counter: 0,
+          ciphertext: Uint8List(32),
+        ),
+        throwsArgumentError,
+      );
+    });
+
+    group('refuses nonsense before allocating anything', () {
+      test('a step beyond the pattern', () {
+        final f = Frame.handshake(
+          dest: dest,
+          src: src,
+          step: 0,
+          body: Uint8List(32),
+        );
+        f.payload[18] = 9;
+        expect(HandshakeMessage.parse(f), isNull);
+      });
+
+      test('an empty handshake body', () {
+        expect(
+          HandshakeMessage.parse(
+            Frame.handshake(
+              dest: dest,
+              src: src,
+              step: 0,
+              body: Uint8List(0),
+            ),
+          ),
+          isNull,
+        );
+      });
+
+      test('a frame addressed to its own sender', () {
+        expect(
+          HandshakeMessage.parse(
+            Frame.handshake(
+              dest: dest,
+              src: dest,
+              step: 0,
+              body: Uint8List(32),
+            ),
+          ),
+          isNull,
+        );
+      });
+
+      test('a ciphertext too short to hold a tag', () {
+        expect(
+          SealedEnvelope.parse(
+            Frame.sealed(
+              dest: dest,
+              src: src,
+              counter: 0,
+              ciphertext: Uint8List(8),
+            ),
+          ),
+          isNull,
+        );
+      });
+
+      test('a payload too short to hold the header', () {
+        final truncated = Frame(
+          envelopeVer: 1,
+          ttl: 3,
+          msgId: '0011223344556677',
+          payload: Uint8List.fromList([1, Frame.typeSealed, 1, 2, 3]),
+        );
+        expect(SealedEnvelope.parse(truncated), isNull);
+        expect(HandshakeMessage.parse(truncated), isNull);
+      });
+    });
+  });
+
   group('fragmentation', () {
     Uint8List rejoin(List<Frame> parts) {
       final out = <int>[];

@@ -25,6 +25,8 @@ class Frame {
   static const typeText = 1;
   static const typeHello = 2;
   static const typeFragment = 3;
+  static const typeHandshake = 4;
+  static const typeSealed = 5;
 
   /// Hop budget a fresh message starts with. A receiver turns the ttl it
   /// sees back into a hop count: hops = defaultTtl - ttl.
@@ -37,6 +39,27 @@ class Frame {
   /// refused rather than sent, so one message cannot occupy the radio
   /// indefinitely. Raise it when there is a reason to.
   static const maxFragments = 64;
+
+  /// Bytes of addressing inside a directed payload: 8 destination, 8 source.
+  ///
+  /// Addressing lives in the payload rather than the envelope because the
+  /// envelope is frozen and a relay has no business reading it. A relay floods
+  /// these exactly like anything else: it cannot tell them apart, and it does
+  /// not need to.
+  ///
+  /// Both ids are in the clear. Sealing hides what is said, not who is saying it
+  /// to whom, and pretending otherwise would be worse than saying so.
+  static const addressLength = 16;
+
+  /// Addressing plus the handshake step number.
+  static const handshakeHeaderLength = addressLength + 1;
+
+  /// Addressing plus the 8 byte transport counter.
+  static const sealedHeaderLength = addressLength + 8;
+
+  /// Largest plaintext that still fits one unfragmented sealed frame.
+  static const sealedPlaintextBudget =
+      meshMtu - headerLength - 2 - sealedHeaderLength - 16;
 
   /// The largest frame this mesh will put on the air, in bytes.
   ///
@@ -82,6 +105,10 @@ class Frame {
 
   bool get isFragment => innerVer == innerVersion && type == typeFragment;
 
+  bool get isHandshake => innerVer == innerVersion && type == typeHandshake;
+
+  bool get isSealed => innerVer == innerVersion && type == typeSealed;
+
   static final _rnd = Random.secure();
 
   /// Announces our node id on one link. The advertised name cannot carry this:
@@ -92,6 +119,84 @@ class Frame {
 
   factory Frame.text(String message, {int ttl = defaultTtl}) =>
       _build(typeText, message, ttl);
+
+  /// One step of a Noise handshake, addressed to a particular peer.
+  ///
+  /// Relayable, unlike a hello. A hello identifies a link and dies with it, but
+  /// a session belongs to a peer and has to survive the link churn we measured:
+  /// legs come and go constantly, and a peer can stop being a neighbour without
+  /// stopping being reachable.
+  ///
+  /// [step] is carried rather than inferred so a restarted handshake can be
+  /// recognised. Over a flooding mesh a step can be lost or arrive twice, and a
+  /// receiver that guessed the step from its own state would deadlock.
+  factory Frame.handshake({
+    required String dest,
+    required String src,
+    required int step,
+    required Uint8List body,
+    int ttl = defaultTtl,
+  }) {
+    final payload = Uint8List(2 + handshakeHeaderLength + body.length);
+    payload[0] = innerVersion;
+    payload[1] = typeHandshake;
+    _writeId(payload, 2, dest);
+    _writeId(payload, 10, src);
+    payload[18] = step;
+    payload.setRange(2 + handshakeHeaderLength, payload.length, body);
+    return Frame(
+      envelopeVer: envelopeVersion,
+      ttl: ttl,
+      msgId: _newMsgId(),
+      payload: payload,
+    );
+  }
+
+  /// A message only [dest] can read.
+  ///
+  /// The counter travels with it because this mesh delivers out of order, and
+  /// Noise's implicit transport counter cannot survive that.
+  factory Frame.sealed({
+    required String dest,
+    required String src,
+    required int counter,
+    required Uint8List ciphertext,
+    int ttl = defaultTtl,
+  }) {
+    final payload = Uint8List(2 + sealedHeaderLength + ciphertext.length);
+    payload[0] = innerVersion;
+    payload[1] = typeSealed;
+    _writeId(payload, 2, dest);
+    _writeId(payload, 10, src);
+    ByteData.view(payload.buffer).setUint64(18, counter, Endian.big);
+    payload.setRange(2 + sealedHeaderLength, payload.length, ciphertext);
+    return Frame(
+      envelopeVer: envelopeVersion,
+      ttl: ttl,
+      msgId: _newMsgId(),
+      payload: payload,
+    );
+  }
+
+  /// Writes a 16 character hex id as 8 bytes at [offset].
+  static void _writeId(Uint8List out, int offset, String hexId) {
+    if (hexId.length != 16) {
+      throw ArgumentError('peer id must be 16 hex characters, got "$hexId"');
+    }
+    for (var i = 0; i < 8; i++) {
+      final b = int.tryParse(hexId.substring(i * 2, i * 2 + 2), radix: 16);
+      if (b == null) throw ArgumentError('peer id is not hex: "$hexId"');
+      out[offset + i] = b;
+    }
+  }
+
+  static String _readId(Uint8List p, int offset) {
+    final out = StringBuffer();
+    for (var i = 0; i < 8; i++) {
+      out.write(p[offset + i].toRadixString(16).padLeft(2, '0'));
+    }
+    return out.toString();
+  }
 
   /// One piece of a larger frame.
   ///
@@ -235,6 +340,119 @@ class Frame {
 /// Everything is validated here, before a single byte is buffered. A peer that
 /// claims 60000 pieces or an index past the end gets rejected at parse time
 /// rather than after we have allocated something on its behalf.
+/// A handshake step as it arrived, once it has been checked.
+///
+/// Everything is validated before anything is allocated. These frames come off
+/// the radio from anyone at all, and a peer claiming a nonsense step or a short
+/// body should cost us nothing.
+class HandshakeMessage {
+  const HandshakeMessage({
+    required this.dest,
+    required this.src,
+    required this.step,
+    required this.body,
+  });
+
+  /// Steps in an XX handshake. A step outside this range is refused.
+  static const maxStep = 2;
+
+  final String dest;
+  final String src;
+  final int step;
+  final Uint8List body;
+
+  String get srcLabel => _labelOf(src);
+
+  static HandshakeMessage? parse(Frame frame) {
+    if (!frame.isHandshake) return null;
+    final p = frame.payload;
+    if (p.length < 2 + Frame.handshakeHeaderLength) return null;
+
+    final step = p[18];
+    if (step > maxStep) return null;
+
+    // An empty body is never a valid handshake step, and a self-addressed one
+    // is either a bug or someone playing games.
+    final body = Uint8List.sublistView(p, 2 + Frame.handshakeHeaderLength);
+    if (body.isEmpty) return null;
+
+    final dest = Frame._readId(p, 2);
+    final src = Frame._readId(p, 10);
+    if (dest == src) return null;
+
+    return HandshakeMessage(dest: dest, src: src, step: step, body: body);
+  }
+}
+
+/// A sealed message as it arrived, once it has been checked.
+class SealedEnvelope {
+  const SealedEnvelope({
+    required this.dest,
+    required this.src,
+    required this.counter,
+    required this.ciphertext,
+  });
+
+  final String dest;
+  final String src;
+  final int counter;
+  final Uint8List ciphertext;
+
+  String get srcLabel => _labelOf(src);
+
+  static SealedEnvelope? parse(Frame frame) {
+    if (!frame.isSealed) return null;
+    final p = frame.payload;
+    if (p.length < 2 + Frame.sealedHeaderLength) return null;
+
+    // Shorter than a tag means there is no authenticated message in there at
+    // all, whatever else it might be.
+    final ciphertext = Uint8List.sublistView(p, 2 + Frame.sealedHeaderLength);
+    if (ciphertext.length < 16) return null;
+
+    final counter = ByteData.view(
+      p.buffer,
+      p.offsetInBytes,
+    ).getUint64(18, Endian.big);
+    if (counter < 0) return null;
+
+    final dest = Frame._readId(p, 2);
+    final src = Frame._readId(p, 10);
+    if (dest == src) return null;
+
+    return SealedEnvelope(
+      dest: dest,
+      src: src,
+      counter: counter,
+      ciphertext: ciphertext,
+    );
+  }
+}
+
+/// The four character label for a peer id.
+///
+/// Duplicated from NodeIdentity rather than imported, so the wire format has no
+/// dependency on the identity module. The derivation is fixed by the format.
+String _labelOf(String peerIdHex) {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  final out = StringBuffer();
+  var acc = 0;
+  var bits = 0;
+  var i = 0;
+  while (out.length < 4 && i + 1 < peerIdHex.length) {
+    if (bits < 5) {
+      final b = int.tryParse(peerIdHex.substring(i, i + 2), radix: 16);
+      if (b == null) break;
+      i += 2;
+      acc = (acc << 8) | b;
+      bits += 8;
+    }
+    bits -= 5;
+    out.write(alphabet[(acc >> bits) & 0x1f]);
+  }
+  return out.toString();
+}
+
 class FragmentPart {
   const FragmentPart({
     required this.id,

@@ -74,20 +74,39 @@ class NodeIdentity {
   /// a restart. Four characters is 20 bits, which is nowhere near collision
   /// resistant and is not meant to be: [peerId] and [fingerprint] are the
   /// identity, this is the name badge.
-  String get shortId {
+  String get shortId => shortLabelFor(fingerprint);
+
+  /// The label for any node, given its fingerprint or just the start of it.
+  ///
+  /// Four characters is 20 bits, which falls inside the first 8 bytes, which is
+  /// exactly what [peerId] carries. So a peer that tells us its id has told us
+  /// its label too, and there is no second thing to send or to disagree about.
+  static String shortLabelFor(List<int> fingerprintPrefix) {
     final out = StringBuffer();
     var acc = 0;
     var bits = 0;
     var i = 0;
     while (out.length < shortIdLength) {
       if (bits < 5) {
-        acc = (acc << 8) | fingerprint[i++];
+        if (i >= fingerprintPrefix.length) break;
+        acc = (acc << 8) | fingerprintPrefix[i++];
         bits += 8;
       }
       bits -= 5;
       out.write(_alphabet[(acc >> bits) & 0x1f]);
     }
     return out.toString();
+  }
+
+  /// The label for a peer id given as hex, as it arrives in a hello.
+  static String shortLabelForHex(String peerIdHex) {
+    final bytes = <int>[];
+    for (var i = 0; i + 1 < peerIdHex.length; i += 2) {
+      final b = int.tryParse(peerIdHex.substring(i, i + 2), radix: 16);
+      if (b == null) break;
+      bytes.add(b);
+    }
+    return shortLabelFor(bytes);
   }
 
   /// A fresh seed. Random.secure is the platform CSPRNG.
