@@ -135,6 +135,120 @@ void main() {
       expect(Frame.forwarded(bytes), isNull);
     });
   });
+
+  group('fragmentation', () {
+    Uint8List rejoin(List<Frame> parts) {
+      final out = <int>[];
+      for (final f in parts) {
+        out.addAll(FragmentPart.parse(f)!.chunk);
+      }
+      return Uint8List.fromList(out);
+    }
+
+    test('splits and rejoins to the original bytes', () {
+      final original = Frame.text('x' * 1500).encode();
+      final parts = Frame.split(original, chunkSize: 400, ttl: 3)!;
+      expect(parts.length, 4);
+      expect(rejoin(parts), original);
+      expect(Frame.decode(rejoin(parts))!.text, 'x' * 1500);
+    });
+
+    test('every piece is an ordinary frame with its own msgId', () {
+      final parts =
+          Frame.split(Frame.text('y' * 900).encode(), chunkSize: 300, ttl: 3)!;
+      expect(parts.map((f) => f.msgId).toSet().length, parts.length);
+      // and they all share one fragment id
+      expect(parts.map((f) => FragmentPart.parse(f)!.id).toSet().length, 1);
+    });
+
+    test('pieces carry the ttl so relays forward them normally', () {
+      final parts =
+          Frame.split(Frame.text('z' * 500).encode(), chunkSize: 200, ttl: 2)!;
+      for (final f in parts) {
+        expect(f.ttl, 2);
+        expect(Frame.forwarded(f.encode()), isNotNull);
+      }
+    });
+
+    test('index and total are correct across the set', () {
+      final parts =
+          Frame.split(Frame.text('a' * 1000).encode(), chunkSize: 256, ttl: 3)!;
+      for (var i = 0; i < parts.length; i++) {
+        final part = FragmentPart.parse(parts[i])!;
+        expect(part.index, i);
+        expect(part.total, parts.length);
+      }
+    });
+
+    test('refuses to split into more than maxFragments', () {
+      final big = Frame.text('b' * 100000).encode();
+      expect(Frame.split(big, chunkSize: 64, ttl: 3), isNull);
+    });
+
+    test('a single small chunk still produces one valid piece', () {
+      final one = Frame.text('hi').encode();
+      final parts = Frame.split(one, chunkSize: 500, ttl: 3)!;
+      expect(parts.length, 1);
+      expect(rejoin(parts), one);
+    });
+
+    // Everything below is a peer lying to us. None of it should get as far as
+    // allocating a buffer.
+    // Absolute offsets into an encoded fragment frame:
+    //   0..11  envelope (Frame.headerLength)
+    //   12     inner version
+    //   13     inner type
+    //   14..21 fragment id
+    //   22..23 index
+    //   24..25 total
+    const indexOffset = Frame.headerLength + 2 + 8;
+    const totalOffset = Frame.headerLength + 2 + 10;
+
+    Uint8List onePiece() => Frame.split(
+          Frame.text('x' * 100).encode(),
+          chunkSize: 50,
+          ttl: 3,
+        )!
+            .first
+            .encode();
+
+    test('rejects a total of zero', () {
+      final bytes = onePiece();
+      bytes[totalOffset] = 0;
+      bytes[totalOffset + 1] = 0;
+      expect(FragmentPart.parse(Frame.decode(bytes)!), isNull);
+    });
+
+    test('rejects a total above maxFragments', () {
+      final bytes = onePiece();
+      bytes[totalOffset] = 0xFF; // 65535 pieces
+      bytes[totalOffset + 1] = 0xFF;
+      expect(FragmentPart.parse(Frame.decode(bytes)!), isNull);
+    });
+
+    test('rejects an index past the end', () {
+      final bytes = onePiece();
+      expect(FragmentPart.parse(Frame.decode(bytes)!)!.total, lessThan(99));
+      bytes[indexOffset] = 0x00;
+      bytes[indexOffset + 1] = 0x63; // index 99
+      expect(FragmentPart.parse(Frame.decode(bytes)!), isNull);
+    });
+
+    test('rejects a payload too short to hold a header', () {
+      final stunted = Frame(
+        envelopeVer: Frame.envelopeVersion,
+        ttl: 3,
+        msgId: '0011223344556677',
+        payload:
+            Uint8List.fromList([Frame.innerVersion, Frame.typeFragment, 1]),
+      );
+      expect(FragmentPart.parse(Frame.decode(stunted.encode())!), isNull);
+    });
+
+    test('a text frame is not mistaken for a fragment', () {
+      expect(FragmentPart.parse(Frame.text('hello')), isNull);
+    });
+  });
 }
 
 // Appended: hello frames carry the node id in-band, because Android cannot

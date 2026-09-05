@@ -24,10 +24,19 @@ class Frame {
   static const innerVersion = 1;
   static const typeText = 1;
   static const typeHello = 2;
+  static const typeFragment = 3;
 
   /// Hop budget a fresh message starts with. A receiver turns the ttl it
   /// sees back into a hop count: hops = defaultTtl - ttl.
   static const defaultTtl = 3;
+
+  /// Bytes of fragment header inside the payload: 8 id, 2 index, 2 total.
+  static const fragmentHeaderLength = 12;
+
+  /// Ceiling on how many pieces one message may become. Anything above this is
+  /// refused rather than sent, so one message cannot occupy the radio
+  /// indefinitely. Raise it when there is a reason to.
+  static const maxFragments = 64;
 
   const Frame({
     required this.envelopeVer,
@@ -55,6 +64,8 @@ class Frame {
 
   bool get isHello => innerVer == innerVersion && type == typeHello;
 
+  bool get isFragment => innerVer == innerVersion && type == typeFragment;
+
   static final _rnd = Random.secure();
 
   /// Announces our node id on one link. The advertised name cannot carry this:
@@ -66,20 +77,86 @@ class Frame {
   factory Frame.text(String message, {int ttl = defaultTtl}) =>
       _build(typeText, message, ttl);
 
+  /// One piece of a larger frame.
+  ///
+  /// The chunk is a slice of the *original complete frame*, envelope included,
+  /// so gluing the pieces back together gives something [decode] understands. A
+  /// relay never needs to know any of this: a fragment is an ordinary frame with
+  /// its own msgId and ttl, so it floods and dedupes like anything else.
+  factory Frame.fragment({
+    required String fragmentId,
+    required int index,
+    required int total,
+    required Uint8List chunk,
+    required int ttl,
+  }) {
+    final payload = Uint8List(2 + fragmentHeaderLength + chunk.length);
+    payload[0] = innerVersion;
+    payload[1] = typeFragment;
+    for (var i = 0; i < 8; i++) {
+      payload[2 + i] = int.parse(
+        fragmentId.substring(i * 2, i * 2 + 2),
+        radix: 16,
+      );
+    }
+    final view = ByteData.view(payload.buffer);
+    view.setUint16(10, index, Endian.big);
+    view.setUint16(12, total, Endian.big);
+    payload.setRange(2 + fragmentHeaderLength, payload.length, chunk);
+
+    return Frame(
+      envelopeVer: envelopeVersion,
+      ttl: ttl,
+      msgId: _newMsgId(),
+      payload: payload,
+    );
+  }
+
+  /// Splits [frameBytes] into pieces that each carry at most [chunkSize] bytes.
+  /// Returns null when that would need more than [maxFragments].
+  static List<Frame>? split(
+    Uint8List frameBytes, {
+    required int chunkSize,
+    required int ttl,
+  }) {
+    if (chunkSize <= 0 || frameBytes.isEmpty) return null;
+    final total = (frameBytes.length + chunkSize - 1) ~/ chunkSize;
+    if (total > maxFragments) return null;
+
+    final id = _newMsgId();
+    return [
+      for (var i = 0; i < total; i++)
+        Frame.fragment(
+          fragmentId: id,
+          index: i,
+          total: total,
+          chunk: Uint8List.sublistView(
+            frameBytes,
+            i * chunkSize,
+            ((i + 1) * chunkSize).clamp(0, frameBytes.length),
+          ),
+          ttl: ttl,
+        ),
+    ];
+  }
+
   static Frame _build(int type, String message, int ttl) {
     final body = utf8.encode(message);
     final payload = Uint8List(2 + body.length)
       ..[0] = innerVersion
       ..[1] = type
       ..setRange(2, 2 + body.length, body);
-    final id = List.generate(8, (_) => _rnd.nextInt(256));
-    final msgId = id.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
     return Frame(
       envelopeVer: envelopeVersion,
       ttl: ttl,
-      msgId: msgId,
+      msgId: _newMsgId(),
       payload: payload,
     );
+  }
+
+  static String _newMsgId() {
+    final id = List.generate(8, (_) => _rnd.nextInt(256));
+    return id.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
   }
 
   Uint8List encode() {
@@ -135,4 +212,49 @@ class Frame {
     out[1] = bytes[1] - 1;
     return out;
   }
+}
+
+/// The fragment header parsed out of a fragment frame's payload.
+///
+/// Everything is validated here, before a single byte is buffered. A peer that
+/// claims 60000 pieces or an index past the end gets rejected at parse time
+/// rather than after we have allocated something on its behalf.
+class FragmentPart {
+  const FragmentPart({
+    required this.id,
+    required this.index,
+    required this.total,
+    required this.chunk,
+  });
+
+  /// Groups the pieces of one message. 8 random bytes, as hex.
+  final String id;
+  final int index;
+  final int total;
+  final Uint8List chunk;
+
+  static FragmentPart? parse(Frame frame) {
+    if (!frame.isFragment) return null;
+    final p = frame.payload;
+    if (p.length < 2 + Frame.fragmentHeaderLength) return null;
+
+    final view = ByteData.view(p.buffer, p.offsetInBytes);
+    final index = view.getUint16(10, Endian.big);
+    final total = view.getUint16(12, Endian.big);
+
+    if (total < 1 || total > Frame.maxFragments) return null;
+    if (index >= total) return null;
+
+    final id =
+        p.sublist(2, 10).map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+
+    return FragmentPart(
+      id: id,
+      index: index,
+      total: total,
+      chunk: Uint8List.sublistView(p, 2 + Frame.fragmentHeaderLength),
+    );
+  }
+
+  String get shortId => id.substring(0, 6);
 }

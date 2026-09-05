@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'package:flutter/foundation.dart';
 
+import 'fragment_assembler.dart';
 import 'frame.dart';
 import 'link_ids.dart';
 
@@ -133,6 +134,15 @@ class MeshLink {
 
   /// Relays waiting out their random assessment delay, keyed by msgId.
   final Map<String, _PendingRelay> _pendingRelays = {};
+
+  /// Puts fragmented messages back together. Lives in its own class with its
+  /// own tests, because the interesting part is the limits rather than the
+  /// gluing, and limits are much easier to test without a radio involved.
+  final FragmentAssembler _assembler = FragmentAssembler();
+
+  /// Gap between fragments of one message. Without it we hand the whole set to
+  /// the ATT queue at once and the radio has no room for anything else.
+  static const _fragmentSpacing = Duration(milliseconds: 20);
   final Random _rnd = Random();
   int _relayed = 0;
   int _suppressed = 0;
@@ -480,6 +490,7 @@ class MeshLink {
       r.timer?.cancel();
     }
     _pendingRelays.clear();
+    _assembler.clear();
     _connected.clear();
     try {
       await _central.stopDiscovery();
@@ -518,15 +529,79 @@ class MeshLink {
   /// write is acknowledged and a notify is not.
   Future<void> send(String text) async {
     final frame = Frame.text(text);
-    _markSeen(frame.msgId);
     final bytes = frame.encode();
     final targets = _sendTargets();
+    if (targets.isEmpty) {
+      _log(LogLevel.warn, 'no peers to send to');
+      return;
+    }
+
+    // Every link has its own limit, so the smallest one decides. Sending a
+    // different size to each peer would mean fragmenting differently per peer,
+    // and then a relay could not forward what it received untouched.
+    var limit = targets.first.maxLength;
+    for (final t in targets) {
+      if (t.maxLength < limit) limit = t.maxLength;
+    }
+
+    if (bytes.length <= limit) {
+      _markSeen(frame.msgId);
+      _log(
+        LogLevel.tx,
+        'send ${frame.shortId} ${bytes.length}B to ${targets.length} peer(s)',
+      );
+      for (final t in targets) {
+        await _sendOn(t, bytes, 'send');
+      }
+      return;
+    }
+
+    await _sendFragmented(frame, bytes, limit, targets);
+  }
+
+  /// Splits an oversized frame and sends the pieces.
+  ///
+  /// The pieces are ordinary frames. Each gets its own msgId so dedup and relay
+  /// treat them like any other traffic, and each carries the original ttl so
+  /// they travel just as far. Only the destination glues them back together.
+  Future<void> _sendFragmented(
+    Frame frame,
+    Uint8List bytes,
+    int limit,
+    List<_Target> targets,
+  ) async {
+    final chunkSize =
+        limit - Frame.headerLength - 2 - Frame.fragmentHeaderLength;
+    if (chunkSize <= 0) {
+      _log(LogLevel.error, 'link limit ${limit}B is too small to fragment');
+      return;
+    }
+
+    final parts = Frame.split(bytes, chunkSize: chunkSize, ttl: frame.ttl);
+    if (parts == null) {
+      _log(
+        LogLevel.error,
+        'message needs more than ${Frame.maxFragments} pieces -- not sent',
+      );
+      return;
+    }
+
+    // Remember the whole message, not the pieces. If a piece of our own comes
+    // back to us we want to drop it, and the reassembled frame carries this id.
+    _markSeen(frame.msgId);
     _log(
       LogLevel.tx,
-      'send ${frame.shortId} ${bytes.length}B to ${targets.length} peer(s)',
+      'send ${frame.shortId} ${bytes.length}B as ${parts.length} pieces '
+      'of ${chunkSize}B to ${targets.length} peer(s)',
     );
-    for (final t in targets) {
-      await _sendOn(t, bytes, 'send');
+
+    for (final part in parts) {
+      _markSeen(part.msgId);
+      final partBytes = part.encode();
+      for (final t in targets) {
+        await _sendOn(t, partBytes, 'fragment');
+      }
+      await Future<void>.delayed(_fragmentSpacing);
     }
   }
 
@@ -675,6 +750,14 @@ class MeshLink {
     // Forward before rendering, and regardless of whether we can read it.
     _scheduleRelay(bytes, key, frame);
 
+    // A piece of a bigger message. It has already been relayed above, exactly
+    // like any other frame, so all that is left is to try to put the message
+    // back together.
+    if (frame.isFragment) {
+      _collect(frame, via, peer);
+      return;
+    }
+
     // Relay-but-do-not-render. A node that cannot interpret a payload must
     // still forward it, but it must not show it to the user -- displaying an
     // opaque blob as if it were a message is how a stale build turns another
@@ -689,6 +772,86 @@ class MeshLink {
     }
     if (!_messages.isClosed) {
       _messages.add(InboundMessage(frame: frame, via: via, peer: peer));
+    }
+  }
+
+  // ------------------------------------------------------------- reassembly
+
+  /// Takes one piece of a larger message and, once the set is complete, hands
+  /// the rebuilt frame back to the normal receive path.
+  ///
+  /// The rebuilt frame is delivered locally and never relayed. The pieces did
+  /// the relaying on their way here, so forwarding the whole thing again would
+  /// put the same message on the radio twice.
+  void _collect(Frame frame, String via, String peer) {
+    final part = FragmentPart.parse(frame);
+    if (part == null) {
+      _log(LogLevel.warn, 'malformed fragment from $peer -- dropped');
+      return;
+    }
+
+    final outcome = _assembler.add(part);
+    for (final id in _assembler.expiredIds) {
+      _log(LogLevel.warn, 'gave up on ${id.substring(0, 6)}, went quiet');
+    }
+
+    switch (outcome.status) {
+      case AssemblyStatus.started:
+        _log(
+          LogLevel.info,
+          'assembling ${part.shortId}, ${part.total} pieces, from $peer',
+        );
+      case AssemblyStatus.stored:
+        _log(
+          LogLevel.info,
+          '${part.shortId} ${outcome.have}/${outcome.total}',
+        );
+      case AssemblyStatus.duplicate:
+        return;
+      case AssemblyStatus.oversized:
+        _log(
+          LogLevel.warn,
+          '${part.shortId} would exceed the size limit -- abandoned',
+        );
+        return;
+      case AssemblyStatus.complete:
+        _deliverRebuilt(outcome.data!, part, via, peer);
+    }
+  }
+
+  /// A rebuilt message is delivered locally and never relayed. The pieces did
+  /// the relaying on their way here, so forwarding the whole thing again would
+  /// put the same message on the radio a second time.
+  void _deliverRebuilt(
+    Uint8List bytes,
+    FragmentPart part,
+    String via,
+    String peer,
+  ) {
+    final rebuilt = Frame.decode(bytes);
+    if (rebuilt == null) {
+      _log(LogLevel.warn, '${part.shortId} rebuilt into nothing usable');
+      return;
+    }
+    if (!_markSeen(rebuilt.msgId)) {
+      _log(LogLevel.info, '${part.shortId} rebuilt, already seen -- dropped');
+      return;
+    }
+
+    _log(
+      LogLevel.rx,
+      'rebuilt ${rebuilt.shortId} from ${part.total} pieces, ${bytes.length}B',
+    );
+
+    if (!rebuilt.isReadableText) {
+      _log(
+        LogLevel.warn,
+        'rebuilt inner v${rebuilt.innerVer} type ${rebuilt.type} unknown',
+      );
+      return;
+    }
+    if (!_messages.isClosed) {
+      _messages.add(InboundMessage(frame: rebuilt, via: via, peer: peer));
     }
   }
 
