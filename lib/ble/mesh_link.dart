@@ -553,15 +553,12 @@ class MeshLink {
       return;
     }
 
-    // Every link has its own limit, so the smallest one decides. Sending a
-    // different size to each peer would mean fragmenting differently per peer,
-    // and then a relay could not forward what it received untouched.
-    var limit = targets.first.maxLength;
-    for (final t in targets) {
-      if (t.maxLength < limit) limit = t.maxLength;
-    }
-
-    if (bytes.length <= limit) {
+    // Sized against the mesh, not against our own links. A piece has to cross
+    // hops we cannot see and a relay forwards it untouched, so the only size
+    // guaranteed to travel is one every link can carry. Sizing against our own
+    // smallest link produced pieces our neighbour accepted and its neighbour
+    // could not.
+    if (bytes.length <= Frame.meshMtu) {
       _markSeen(frame.msgId);
       _log(
         LogLevel.tx,
@@ -573,7 +570,7 @@ class MeshLink {
       return;
     }
 
-    await _sendFragmented(frame, bytes, limit, targets);
+    await _sendFragmented(frame, bytes, targets);
   }
 
   /// Splits an oversized frame and sends the pieces.
@@ -584,15 +581,10 @@ class MeshLink {
   Future<void> _sendFragmented(
     Frame frame,
     Uint8List bytes,
-    int limit,
     List<_Target> targets,
   ) async {
-    final chunkSize =
-        limit - Frame.headerLength - 2 - Frame.fragmentHeaderLength;
-    if (chunkSize <= 0) {
-      _log(LogLevel.error, 'link limit ${limit}B is too small to fragment');
-      return;
-    }
+    const chunkSize =
+        Frame.meshMtu - Frame.headerLength - 2 - Frame.fragmentHeaderLength;
 
     final parts = Frame.split(bytes, chunkSize: chunkSize, ttl: frame.ttl);
     if (parts == null) {

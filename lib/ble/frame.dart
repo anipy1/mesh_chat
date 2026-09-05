@@ -38,6 +38,22 @@ class Frame {
   /// indefinitely. Raise it when there is a reason to.
   static const maxFragments = 64;
 
+  /// The largest frame this mesh will put on the air, in bytes.
+  ///
+  /// Fragmentation has to be sized against the mesh, not against the sender's
+  /// own links. A relay forwards a piece untouched, on purpose, so a piece
+  /// sized to fit our neighbour can still be too large for the hop after it,
+  /// and a relay cannot split one without reassembling first. Sizing every
+  /// piece to a floor any link can carry is what lets fragmentation and
+  /// relaying work together at all.
+  ///
+  /// 185 is the conservative figure both platforms are safe at. Our own phones
+  /// negotiated well beyond it, 512 usable in both directions with one link at
+  /// 371, so this can be raised. It should be raised on evidence from more
+  /// devices than three, though, because the cost of being wrong is a message
+  /// that crosses one hop and dies at the next.
+  static const meshMtu = 185;
+
   const Frame({
     required this.envelopeVer,
     required this.ttl,

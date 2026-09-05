@@ -180,6 +180,39 @@ void main() {
       }
     });
 
+    test('a piece sized for the mesh fits inside the mesh mtu', () {
+      // The property the whole design rests on: a relay forwards a piece
+      // untouched, so every piece has to be small enough for any link in the
+      // mesh, not just the one it was sent on.
+      const chunkSize =
+          Frame.meshMtu - Frame.headerLength - 2 - Frame.fragmentHeaderLength;
+      final parts = Frame.split(
+        Frame.text('z' * 4000).encode(),
+        chunkSize: chunkSize,
+        ttl: 3,
+      )!;
+      expect(parts.length, greaterThan(1));
+      for (final piece in parts) {
+        expect(piece.encode().length, lessThanOrEqualTo(Frame.meshMtu));
+      }
+    });
+
+    test('a forwarded piece does not grow past the mesh mtu', () {
+      // Relaying rewrites the ttl in place, so a piece that fitted on the way
+      // in must still fit on the way out.
+      const chunkSize =
+          Frame.meshMtu - Frame.headerLength - 2 - Frame.fragmentHeaderLength;
+      final parts = Frame.split(
+        Frame.text('w' * 2000).encode(),
+        chunkSize: chunkSize,
+        ttl: 3,
+      )!;
+      for (final piece in parts) {
+        final forwarded = Frame.forwarded(piece.encode())!;
+        expect(forwarded.length, lessThanOrEqualTo(Frame.meshMtu));
+      }
+    });
+
     test('refuses to split into more than maxFragments', () {
       final big = Frame.text('b' * 100000).encode();
       expect(Frame.split(big, chunkSize: 64, ttl: 3), isNull);
