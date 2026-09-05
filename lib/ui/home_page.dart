@@ -13,10 +13,16 @@ class ChatEntry {
     required this.text,
     required this.mine,
     required this.detail,
+    this.sealed = false,
   }) : time = DateTime.now();
   final String text;
   final bool mine;
   final String detail;
+
+  /// Shown differently, because "nobody else could read this" is the whole
+  /// point and a reader should never have to guess which kind they are looking
+  /// at.
+  final bool sealed;
   final DateTime time;
 }
 
@@ -68,12 +74,18 @@ class _HomePageState extends State<HomePage> {
           ChatEntry(
             // MeshLink only surfaces frames it can render now; unknown
             // types are logged and relayed, never shown.
-            text: msg.frame.text,
+            text: msg.text,
             mine: false,
+            sealed: msg.isSealed,
             detail: () {
               final hops = Frame.defaultTtl - msg.frame.ttl;
               final path = hops <= 0 ? 'direct' : '$hops hop';
-              return '${msg.via} · ${msg.peer} · $path · ttl ${msg.frame.ttl}';
+              // For a sealed message the sender is proved by the session, not
+              // taken from the frame, so it is worth naming.
+              final who = msg.isSealed
+                  ? 'from ${MeshLink.labelOf(msg.sealedFrom!)}'
+                  : msg.peer;
+              return '${msg.via} · $who · $path · ttl ${msg.frame.ttl}';
             }(),
           ),
         );
@@ -107,21 +119,31 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  /// Who the next message is for, or null for everyone.
+  String? _recipient;
+
   Future<void> _send() async {
     final text = _input.text.trim();
     if (text.isEmpty) return;
+    final to = _recipient;
     _input.clear();
     setState(() {
       _chat.add(
         ChatEntry(
           text: text,
           mine: true,
-          detail: '${_link.outboundPeers} out · '
-              '${_link.subscribedCentrals} sub',
+          sealed: to != null,
+          detail: to == null
+              ? '${_link.outboundPeers} out · ${_link.subscribedCentrals} sub'
+              : 'sealed to ${MeshLink.labelOf(to)}',
         ),
       );
     });
-    await _link.send(text);
+    if (to == null) {
+      await _link.send(text);
+    } else {
+      await _link.sendSealed(to, text);
+    }
     if (mounted) setState(() {});
   }
 
@@ -158,8 +180,13 @@ class _HomePageState extends State<HomePage> {
                     CheckboxListTile(
                       dense: true,
                       contentPadding: EdgeInsets.zero,
-                      title: Text(id,
-                          style: const TextStyle(fontFamily: 'monospace')),
+                      title: Text(
+                        MeshLink.labelOf(id),
+                        style: const TextStyle(fontFamily: 'monospace'),
+                      ),
+                      subtitle: id.length == 16
+                          ? Text(id, style: const TextStyle(fontSize: 9))
+                          : null,
                       value: _link.blocked.contains(id),
                       onChanged: (v) => setSheet(() {
                         if (v ?? false) {
@@ -305,18 +332,38 @@ class _HomePageState extends State<HomePage> {
                                 ? scheme.primaryContainer
                                 : scheme.surfaceContainerHighest,
                             borderRadius: BorderRadius.circular(12),
+                            // A sealed message is marked by an outline as well
+                            // as the padlock. Colour alone is a bad way to
+                            // carry the only thing that distinguishes private
+                            // from public.
+                            border: e.sealed
+                                ? Border.all(color: scheme.primary, width: 1.5)
+                                : null,
                           ),
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Text(e.text),
                               const SizedBox(height: 2),
-                              Text(
-                                e.detail,
-                                style: TextStyle(
-                                  fontSize: 10,
-                                  color: scheme.onSurfaceVariant,
-                                ),
+                              Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  if (e.sealed) ...[
+                                    Icon(
+                                      Icons.lock,
+                                      size: 10,
+                                      color: scheme.primary,
+                                    ),
+                                    const SizedBox(width: 3),
+                                  ],
+                                  Text(
+                                    e.detail,
+                                    style: TextStyle(
+                                      fontSize: 10,
+                                      color: scheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ],
                               ),
                             ],
                           ),
@@ -326,6 +373,39 @@ class _HomePageState extends State<HomePage> {
                   ),
           ),
           const Divider(height: 1),
+          // Who the next message goes to. Only peers with a live session can be
+          // picked: without one there is nothing to seal with, and offering a
+          // peer we cannot actually reach privately would be a lie.
+          if (running && _link.sessionPeers.isNotEmpty)
+            SizedBox(
+              height: 44,
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.only(right: 6, top: 6),
+                    child: ChoiceChip(
+                      label: const Text('everyone'),
+                      selected: _recipient == null,
+                      onSelected: (_) => setState(() => _recipient = null),
+                    ),
+                  ),
+                  for (final peer in _link.sessionPeers)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 6, top: 6),
+                      child: ChoiceChip(
+                        avatar: const Icon(Icons.lock, size: 14),
+                        label: Text(MeshLink.labelOf(peer)),
+                        selected: _recipient == peer,
+                        onSelected: (_) => setState(
+                          () => _recipient = _recipient == peer ? null : peer,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             child: Row(
@@ -336,10 +416,12 @@ class _HomePageState extends State<HomePage> {
                     enabled: running,
                     textInputAction: TextInputAction.send,
                     onSubmitted: (_) => _send(),
-                    decoration: const InputDecoration(
+                    decoration: InputDecoration(
                       isDense: true,
-                      border: OutlineInputBorder(),
-                      hintText: 'message',
+                      border: const OutlineInputBorder(),
+                      hintText: _recipient == null
+                          ? 'message'
+                          : 'sealed to ${MeshLink.labelOf(_recipient!)}',
                     ),
                   ),
                 ),

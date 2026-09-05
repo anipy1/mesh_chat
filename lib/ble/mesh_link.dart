@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 import 'dart:io';
 
@@ -9,6 +10,8 @@ import 'fragment_assembler.dart';
 import 'frame.dart';
 import '../identity/identity_store.dart';
 import '../identity/node_identity.dart';
+import '../noise/noise_protocol.dart';
+import '../noise/session_manager.dart';
 import 'link_ids.dart';
 
 enum LogLevel { info, tx, rx, warn, error }
@@ -25,10 +28,31 @@ class LogLine {
 }
 
 class InboundMessage {
-  InboundMessage({required this.frame, required this.via, required this.peer});
+  InboundMessage({
+    required this.frame,
+    required this.via,
+    required this.peer,
+    this.sealedFrom,
+    this.sealedText,
+  });
+
   final Frame frame;
   final String via; // 'notify' (we are central) or 'write' (we are peripheral)
   final String peer;
+
+  /// Set when this arrived sealed: the peer id it was proved to come from.
+  ///
+  /// Proved rather than claimed. The source field in the frame is just bytes
+  /// anyone can write, but a sealed message only opens under a session that
+  /// was authenticated to that peer's key.
+  final String? sealedFrom;
+
+  /// The decrypted text, when [sealedFrom] is set.
+  final String? sealedText;
+
+  bool get isSealed => sealedFrom != null;
+
+  String get text => sealedText ?? frame.text;
 }
 
 /// A peer we connected outward to. We are central, it is peripheral.
@@ -54,10 +78,33 @@ class _OutboundLink {
 /// central->peripheral by writing RX, peripheral->central by notifying TX.
 class MeshLink {
   MeshLink({required this.identity, IdentitySource? source}) {
+    _sessions = SessionManager(
+      peerId: identity.peerId,
+      staticKeyPair: identity.noiseKeyPair,
+      onStep: _emitHandshakeStep,
+      onEstablished: (peer, role) => _log(
+        LogLevel.info,
+        'session with ${labelOf(peer)} established ($role)',
+      ),
+      onFailed: (peer, why) => _log(
+        LogLevel.warn,
+        'session with ${labelOf(peer)} failed: ${why.name}',
+      ),
+    );
     _wirePeripheral();
     _wireCentral();
     _announceIdentity(source);
   }
+
+  /// Noise sessions, one per peer.
+  ///
+  /// Keyed on peer id rather than on a link, because legs churn constantly and
+  /// a session tied to one dies with it.
+  late final SessionManager _sessions;
+
+  /// Sweeps handshakes that stalled. Nothing acknowledges a handshake step, so
+  /// a lost one would otherwise leave a pair unable to ever try again.
+  Timer? _sessionSweep;
 
   /// Who this node is. Derived from a seed that outlives the process, so the
   /// id below is the same on every launch.
@@ -213,6 +260,9 @@ class MeshLink {
   bool get running => _running;
   BluetoothLowEnergyState get state => _central.state;
 
+  /// Peers we hold a live Noise session with, so can send a sealed message to.
+  List<String> get sessionPeers => _sessions.establishedPeers.toList()..sort();
+
   int get outboundPeers => _links.length;
   int get inboundPeers => _centrals.length;
   int get subscribedCentrals => _notifyLimit.length;
@@ -223,15 +273,29 @@ class MeshLink {
   Set<String> get knownPeers => {..._outPeerId.values, ..._inPeerId.values};
 
   List<String> get peerLabels => [
-        ..._links.keys.map((k) => 'out ${_outPeerId[k] ?? _short(k)}'),
+        ..._links.keys.map(
+          (k) => 'out '
+              '${_outPeerId[k] == null ? _short(k) : labelOf(_outPeerId[k]!)}',
+        ),
         ..._centrals.keys.map(
-          (k) => 'in ${_inPeerId[k] ?? _short(k)}'
+          (k) => 'in '
+              '${_inPeerId[k] == null ? _short(k) : labelOf(_inPeerId[k]!)}'
               '${_notifyLimit.containsKey(k) ? '*' : ''}',
         ),
       ];
 
   /// Best-known human label for a transport key, either direction.
-  String _label(String key) => _outPeerId[key] ?? _inPeerId[key] ?? _short(key);
+  String _label(String key) {
+    final id = _outPeerId[key] ?? _inPeerId[key];
+    return id == null ? _short(key) : labelOf(id);
+  }
+
+  /// The four character name for a peer id.
+  ///
+  /// A hello carries the id, and the label falls out of its first 20 bits, so
+  /// there is never a second name to send or to disagree about.
+  static String labelOf(String peerId) =>
+      peerId.length == 16 ? NodeIdentity.shortLabelForHex(peerId) : peerId;
 
   Set<String> get blocked => Set.unmodifiable(_blocked);
 
@@ -287,8 +351,9 @@ class MeshLink {
 
   /// Tears down every leg to [nodeId] in both directions.
   void _dropPeer(String nodeId) {
+    bool matches(String id) => id == nodeId || labelOf(id) == nodeId;
     for (final key in _outPeerId.entries
-        .where((e) => e.value == nodeId)
+        .where((e) => matches(e.value))
         .map((e) => e.key)
         .toList()) {
       final link = _links.remove(key);
@@ -301,7 +366,7 @@ class MeshLink {
       });
     }
     for (final key in _inPeerId.entries
-        .where((e) => e.value == nodeId)
+        .where((e) => matches(e.value))
         .map((e) => e.key)
         .toList()) {
       _cancelPrune(key);
@@ -314,8 +379,16 @@ class MeshLink {
 
   bool _isBlockedKey(String key) {
     final id = _outPeerId[key] ?? _inPeerId[key];
-    return id != null && _blocked.contains(id);
+    return id != null && _isBlockedId(id);
   }
+
+  /// Blocks match a peer id or the label derived from it.
+  ///
+  /// The checkbox list works in ids, which are exact, while the text field is
+  /// for typing a label before ever meeting the peer. Both have to land in the
+  /// same set for either to be useful.
+  bool _isBlockedId(String peerId) =>
+      _blocked.contains(peerId) || _blocked.contains(labelOf(peerId));
 
   List<LogLine> get history => List.unmodifiable(_history);
 
@@ -496,6 +569,7 @@ class MeshLink {
         'scanning for service ${'$_serviceUuid'.substring(0, 8)}',
       );
       _running = true;
+      _startSessionSweep();
     } catch (e) {
       // Android error code 1 is SCAN_FAILED_ALREADY_STARTED: the scan we want
       // is running, so this is success wearing an exception.
@@ -539,6 +613,8 @@ class MeshLink {
     _pendingRelays.clear();
     _linkWrites.clear();
     _retiredKeys.clear();
+    _sessionSweep?.cancel();
+    _sessionSweep = null;
     _assembler.clear();
     _connected.clear();
     try {
@@ -576,8 +652,44 @@ class MeshLink {
   /// Iterating legs would double-send to any peer we hold two legs to, so this
   /// iterates *peers* and picks one leg each -- outbound by preference, since a
   /// write is acknowledged and a notify is not.
-  Future<void> send(String text) async {
-    final frame = Frame.text(text);
+  Future<void> send(String text) => _flood(Frame.text(text), 'send');
+
+  /// Seals [text] for [peer] and floods it.
+  ///
+  /// The mesh carries it like any other frame and every relay forwards bytes it
+  /// cannot read. Only [peer] can open it.
+  Future<void> sendSealed(String peer, String text) async {
+    if (!_sessions.hasSession(peer)) {
+      _log(LogLevel.warn, 'no session with ${labelOf(peer)} yet');
+      await _sessions.ensure(peer);
+      return;
+    }
+    final sealed = await _sessions.seal(peer, utf8.encode(text));
+    if (sealed == null) return;
+    await _flood(
+      Frame.sealed(
+        dest: peer,
+        src: identity.peerId,
+        counter: sealed.counter,
+        ciphertext: sealed.ciphertext,
+      ),
+      'sealed to ${labelOf(peer)}',
+    );
+  }
+
+  /// Puts one handshake step on the mesh. Relayable, so it can reach a peer
+  /// that is no longer a direct neighbour.
+  void _emitHandshakeStep(String dest, int step, Uint8List body) {
+    unawaited(
+      _flood(
+        Frame.handshake(
+            dest: dest, src: identity.peerId, step: step, body: body),
+        'handshake $step to ${labelOf(dest)}',
+      ),
+    );
+  }
+
+  Future<void> _flood(Frame frame, String what) async {
     final bytes = frame.encode();
     final targets = _sendTargets();
     if (targets.isEmpty) {
@@ -594,7 +706,7 @@ class MeshLink {
       _markSeen(frame.msgId);
       _log(
         LogLevel.tx,
-        'send ${frame.shortId} ${bytes.length}B to ${targets.length} peer(s)',
+        '$what ${frame.shortId} ${bytes.length}B to ${targets.length} peer(s)',
       );
       for (final t in targets) {
         await _sendOn(t, bytes, 'send');
@@ -741,7 +853,7 @@ class MeshLink {
         _inPeerId[key] = peerId;
       }
       _cancelPrune(key);
-      if (_blocked.contains(peerId)) {
+      if (_isBlockedId(peerId)) {
         _log(LogLevel.warn, 'hello from blocked $peerId -- dropping leg');
         if (via == 'notify') {
           _outPeerId[key] = peerId;
@@ -770,6 +882,10 @@ class MeshLink {
 
       _retireStaleLegs(peerId, key, via);
       _resolveDuplicateLink(peerId);
+      // A hello is the first moment we know who this is, so it is the first
+      // moment a session can be started. ensure is idempotent, and helloes
+      // repeat on every reconnect.
+      unawaited(_sessions.ensure(peerId));
       return;
     }
 
@@ -810,6 +926,38 @@ class MeshLink {
     // back together.
     if (frame.isFragment) {
       _collect(frame, via, peer);
+      return;
+    }
+
+    // Addressed traffic. Relaying already happened above, exactly as for any
+    // other frame, because a relay cannot tell these apart and does not need
+    // to. What is left is deciding whether this one is ours.
+    if (frame.isHandshake) {
+      final step = HandshakeMessage.parse(frame);
+      if (step == null) {
+        _log(LogLevel.warn, 'malformed handshake from $peer -- dropped');
+        return;
+      }
+      // Somebody else's step. It has already been relayed above.
+      if (step.dest != identity.peerId) return;
+      _cancelRelay(frame.msgId);
+      _log(
+        LogLevel.info,
+        'handshake ${step.step} from ${step.srcLabel}',
+      );
+      unawaited(_sessions.handleStep(step.src, step.step, step.body));
+      return;
+    }
+
+    if (frame.isSealed) {
+      final envelope = SealedEnvelope.parse(frame);
+      if (envelope == null) {
+        _log(LogLevel.warn, 'malformed sealed frame from $peer -- dropped');
+        return;
+      }
+      if (envelope.dest != identity.peerId) return;
+      _cancelRelay(frame.msgId);
+      unawaited(_openSealed(envelope, frame, via, peer));
       return;
     }
 
@@ -929,6 +1077,69 @@ class MeshLink {
   /// so at p<1 it will eventually drop a frame that nobody else can carry and
   /// nothing detects the hole. Counting duplicates cannot make that mistake: a
   /// bridge hears no one else, so it always relays.
+  /// Gives up on handshakes that stalled, so they can be tried again.
+  ///
+  /// Nothing acknowledges a handshake step. It floods like any other frame and
+  /// can simply be lost, and without this a single lost step would leave a pair
+  /// unable to ever form a session.
+  void _startSessionSweep() {
+    _sessionSweep?.cancel();
+    _sessionSweep = Timer.periodic(const Duration(seconds: 5), (_) {
+      for (final peer in _sessions.expire()) {
+        _log(LogLevel.warn, 'handshake with ${labelOf(peer)} timed out');
+      }
+    });
+  }
+
+  /// Calls off a relay we queued before realising the frame was for us.
+  ///
+  /// It arrived, so forwarding it again would put a message on the radio that
+  /// nobody is waiting for.
+  void _cancelRelay(String msgId) {
+    _pendingRelays.remove(msgId)?.timer?.cancel();
+  }
+
+  /// Opens a sealed message, or says why it could not be opened.
+  Future<void> _openSealed(
+    SealedEnvelope envelope,
+    Frame frame,
+    String via,
+    String peer,
+  ) async {
+    try {
+      final plain = await _sessions.open(
+        envelope.src,
+        envelope.counter,
+        envelope.ciphertext,
+      );
+      final text = utf8.decode(plain, allowMalformed: true);
+      _log(
+        LogLevel.rx,
+        'sealed message from ${envelope.srcLabel}, '
+        '${envelope.ciphertext.length}B',
+      );
+      if (!_messages.isClosed) {
+        _messages.add(
+          InboundMessage(
+            frame: frame,
+            via: via,
+            peer: peer,
+            sealedFrom: envelope.src,
+            sealedText: text,
+          ),
+        );
+      }
+    } on NoiseError catch (e) {
+      // Expected often enough to be worth saying plainly: a peer that restarted
+      // has a session we no longer share, and its messages cannot open.
+      _log(
+        LogLevel.warn,
+        'sealed message from ${envelope.srcLabel} did not open (${e.message})',
+      );
+      unawaited(_sessions.ensure(envelope.src));
+    }
+  }
+
   void _scheduleRelay(Uint8List bytes, String fromKey, Frame frame) {
     final forward = Frame.forwarded(bytes);
     if (forward == null) {
@@ -1323,7 +1534,7 @@ class MeshLink {
       await _central.writeCharacteristic(
         link.peripheral,
         link.rx,
-        value: Frame.hello(nodeId).encode(),
+        value: Frame.hello(identity.peerId).encode(),
         type: GATTCharacteristicWriteType.withResponse,
       );
     } catch (e) {
@@ -1339,7 +1550,7 @@ class MeshLink {
       await _peripheral.notifyCharacteristic(
         central,
         tx,
-        value: Frame.hello(nodeId).encode(),
+        value: Frame.hello(identity.peerId).encode(),
       );
     } catch (e) {
       _log(LogLevel.warn, 'hello notify failed: ${_brief(e)}');
@@ -1569,6 +1780,7 @@ class MeshLink {
   }
 
   Future<void> dispose() async {
+    _sessionSweep?.cancel();
     for (final r in _pendingRelays.values) {
       r.timer?.cancel();
     }
