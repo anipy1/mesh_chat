@@ -135,6 +135,14 @@ class MeshLink {
   /// Relays waiting out their random assessment delay, keyed by msgId.
   final Map<String, _PendingRelay> _pendingRelays = {};
 
+  /// One write at a time per link.
+  ///
+  /// Android allows a single outstanding GATT operation per connection, so a
+  /// second write issued before the first completes throws. Relays fire from
+  /// independent timers and a fragmented message is a burst of them, so
+  /// without this the pieces collide with each other and are lost.
+  final Map<String, Future<void>> _linkWrites = {};
+
   /// Puts fragmented messages back together. Lives in its own class with its
   /// own tests, because the interesting part is the limits rather than the
   /// gluing, and limits are much easier to test without a radio involved.
@@ -490,6 +498,7 @@ class MeshLink {
       r.timer?.cancel();
     }
     _pendingRelays.clear();
+    _linkWrites.clear();
     _assembler.clear();
     _connected.clear();
     try {
@@ -636,7 +645,20 @@ class MeshLink {
     return [...byPeer.values, ...anonymous];
   }
 
-  Future<void> _sendOn(_Target t, Uint8List bytes, String what) async {
+  /// Queues a write behind whatever is already in flight on this link.
+  Future<void> _sendOn(_Target t, Uint8List bytes, String what) {
+    final prior = _linkWrites[t.key] ?? Future<void>.value();
+    // _writeOn swallows its own errors, so one failed write cannot break the
+    // chain for every write queued behind it.
+    final next = prior.then((_) => _writeOn(t, bytes, what));
+    _linkWrites[t.key] = next;
+    next.whenComplete(() {
+      if (identical(_linkWrites[t.key], next)) _linkWrites.remove(t.key);
+    });
+    return next;
+  }
+
+  Future<void> _writeOn(_Target t, Uint8List bytes, String what) async {
     if (bytes.length > t.maxLength) {
       _log(
         LogLevel.warn,
@@ -1060,10 +1082,26 @@ class MeshLink {
     // getMaximumNotifyLength / getMaximumWriteLength, which work everywhere.
     _safeListen(
       () => _peripheral.mtuChanged,
-      (e) => _log(
-        LogLevel.info,
-        'mtu ${e.mtu} with central ${_short('${e.central.uuid}')}',
-      ),
+      (e) async {
+        final key = '${e.central.uuid}';
+        _log(LogLevel.info, 'mtu ${e.mtu} with central ${_short(key)}');
+        // A central can subscribe before MTU negotiation finishes, and the
+        // limit recorded then is the 23 byte ATT default. Re-read it whenever
+        // the MTU moves, or that leg stays pinned at 20B for its whole life
+        // and refuses everything bigger.
+        if (!_notifyLimit.containsKey(key)) return;
+        try {
+          final limit = await _peripheral.getMaximumNotifyLength(e.central);
+          if (_notifyLimit[key] == limit) return;
+          _notifyLimit[key] = limit;
+          _log(
+            LogLevel.info,
+            'notify limit for ${_label(key)} now ${limit}B',
+          );
+        } catch (err) {
+          _log(LogLevel.warn, 'notify limit refresh failed: $err');
+        }
+      },
       label: 'peripheral.mtuChanged',
     );
   }
