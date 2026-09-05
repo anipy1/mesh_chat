@@ -143,6 +143,13 @@ class MeshLink {
   /// without this the pieces collide with each other and are lost.
   final Map<String, Future<void>> _linkWrites = {};
 
+  /// Outbound keys we closed ourselves because a newer leg to the same node id
+  /// replaced them. Kept apart from [_yieldedKeys] because the two want
+  /// opposite things from the disconnect callback: a yielded leg stays in
+  /// [_dialling] so discovery leaves the peer alone, while a retired one is a
+  /// dead address that should be forgotten completely.
+  final Set<String> _retiredKeys = {};
+
   /// Puts fragmented messages back together. Lives in its own class with its
   /// own tests, because the interesting part is the limits rather than the
   /// gluing, and limits are much easier to test without a radio involved.
@@ -499,6 +506,7 @@ class MeshLink {
     }
     _pendingRelays.clear();
     _linkWrites.clear();
+    _retiredKeys.clear();
     _assembler.clear();
     _connected.clear();
     try {
@@ -736,6 +744,7 @@ class MeshLink {
         }
       }
 
+      _retireStaleLegs(peerId, key, via);
       _resolveDuplicateLink(peerId);
       return;
     }
@@ -996,6 +1005,13 @@ class MeshLink {
         if (e.state == ConnectionState.connected) {
           _centrals[key] = e.central;
           _log(LogLevel.info, 'central ${_short(key)} connected to us');
+          // A central that connects and never subscribes is a leftover. The
+          // Android stack hands a new process the GATT connections the old one
+          // left open, so the app can start with several of these already in
+          // the registry. Arm the same prune the subscribe path uses: without
+          // it nothing here is ever reclaimed, and a long session measured 61
+          // connects against 47 disconnects and zero prunes.
+          _scheduleUnidentifiedPrune(key);
         } else {
           _cancelPrune(key);
           _centrals.remove(key);
@@ -1148,6 +1164,21 @@ class MeshLink {
           await _setUpOutbound(e.peripheral);
         } else {
           _connected.remove(key);
+          // A leg we retired ourselves. No flap accounting and no redial: this
+          // is a rotated address that will not come back, so every trace of it
+          // goes. The peer is still here under its current key.
+          if (_retiredKeys.remove(key)) {
+            _links.remove(key);
+            _outPeerId.remove(key);
+            _helloSent.remove(key);
+            _dialling.remove(key);
+            _flaps.remove(key);
+            _backoffUntil.remove(key);
+            _observed.remove(key);
+            _linkWrites.remove(key);
+            _log(LogLevel.info, 'stale leg ${_short(key)} closed');
+            return;
+          }
           final wasYielded = _yieldedKeys.contains(key);
           final lived = _links[key] == null
               ? null
@@ -1301,6 +1332,55 @@ class MeshLink {
       return true;
     });
     _log(LogLevel.info, '$peerId gone -- dialling re-armed');
+  }
+
+  /// Retires legs to [peerId] other than [keepKey], in the same direction.
+  ///
+  /// Android rotates the address it advertises, so one phone reappears under a
+  /// stream of transport keys and each one adds a leg. Nothing removed the old
+  /// ones: a long session ended up holding fourteen central keys for two real
+  /// phones. A hello is the first moment we can tell that two keys are the same
+  /// peer, so that is where the older leg goes.
+  ///
+  /// Inbound legs are only forgotten, never hung up. They belong to the peer,
+  /// and if one really is still alive its next write registers it again. An
+  /// outbound leg is our own GATT connection, so forgetting it without
+  /// disconnecting would leak it, and Android allows only a handful at once.
+  void _retireStaleLegs(String peerId, String keepKey, String via) {
+    if (via == 'notify') {
+      for (final key in _outPeerId.entries
+          .where((e) => e.value == peerId && e.key != keepKey)
+          .map((e) => e.key)
+          .toList()) {
+        final link = _links[key];
+        if (link == null) {
+          _outPeerId.remove(key);
+          continue;
+        }
+        _retiredKeys.add(key);
+        _log(LogLevel.info, 'retiring stale leg to $peerId (${_short(key)})');
+        _central.disconnect(link.peripheral).catchError((Object e) {
+          // The address is already gone often enough that this is expected.
+          _retiredKeys.remove(key);
+          _links.remove(key);
+          _outPeerId.remove(key);
+          _log(LogLevel.info, 'stale leg ${_short(key)} was already gone');
+        });
+      }
+      return;
+    }
+    for (final key in _inPeerId.entries
+        .where((e) => e.value == peerId && e.key != keepKey)
+        .map((e) => e.key)
+        .toList()) {
+      _cancelPrune(key);
+      _centrals.remove(key);
+      _notifyLimit.remove(key);
+      _inPeerId.remove(key);
+      _helloSent.remove(key);
+      _linkWrites.remove(key);
+      _log(LogLevel.info, 'forgetting stale leg from $peerId (${_short(key)})');
+    }
   }
 
   /// A central that subscribes but never sends a hello is a leftover: either a
