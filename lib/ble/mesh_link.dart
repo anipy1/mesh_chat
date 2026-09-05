@@ -885,7 +885,9 @@ class MeshLink {
       _resolveDuplicateLink(peerId);
       // A hello is the first moment we know who this is, so it is the first
       // moment a session can be started. ensure is idempotent, and helloes
-      // repeat on every reconnect.
+      // repeat on every reconnect, which is also what keeps a neighbour's
+      // session from going idle.
+      _sessions.noteSeen(peerId);
       unawaited(_sessions.ensure(peerId));
       return;
     }
@@ -1086,8 +1088,12 @@ class MeshLink {
   void _startSessionSweep() {
     _sessionSweep?.cancel();
     _sessionSweep = Timer.periodic(const Duration(seconds: 5), (_) {
-      for (final peer in _sessions.expire()) {
+      final swept = _sessions.sweep();
+      for (final peer in swept.stalledHandshakes) {
         _log(LogLevel.warn, 'handshake with ${labelOf(peer)} timed out');
+      }
+      for (final peer in swept.idleSessions) {
+        _log(LogLevel.info, 'session with ${labelOf(peer)} went idle');
       }
     });
   }
@@ -1114,6 +1120,10 @@ class MeshLink {
         envelope.ciphertext,
       );
       final text = utf8.decode(plain, allowMalformed: true);
+      // A message that opened could only have come from them, and for a peer
+      // reached through a relay this is the only evidence there is: a hello
+      // never travels that far.
+      _sessions.noteSeen(envelope.src);
       _log(
         LogLevel.rx,
         'sealed message from ${envelope.srcLabel}, '

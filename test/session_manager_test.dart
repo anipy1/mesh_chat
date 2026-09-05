@@ -299,10 +299,10 @@ void main() {
       wire.steps.clear(); // the opening step never arrives
       expect(wire.nodes[a]!.isHandshaking(b), isTrue);
 
-      expect(wire.nodes[a]!.expire(), isEmpty);
+      expect(wire.nodes[a]!.sweep().isEmpty, isTrue);
 
       now = now.add(const Duration(seconds: 30));
-      expect(wire.nodes[a]!.expire(), [b]);
+      expect(wire.nodes[a]!.sweep().stalledHandshakes, [b]);
       expect(wire.failures[a], contains(SessionFailure.timeout));
       expect(wire.nodes[a]!.isHandshaking(b), isFalse);
 
@@ -312,7 +312,7 @@ void main() {
       expect(wire.nodes[a]!.hasSession(b), isTrue);
     });
 
-    test('an established session does not expire', () async {
+    test('a session that keeps being seen is kept', () async {
       var now = DateTime(2026, 1, 1, 12);
       final wire = await twoNodes(clock: () => now);
       final ids = wire.nodes.keys.toList();
@@ -321,9 +321,133 @@ void main() {
       await wire.nodes[a]!.ensure(b);
       await wire.deliverAll();
 
-      now = now.add(const Duration(hours: 5));
-      expect(wire.nodes[a]!.expire(), isEmpty);
+      // Five hours of a peer that keeps showing up.
+      for (var i = 0; i < 60; i++) {
+        now = now.add(const Duration(minutes: 5));
+        wire.nodes[a]!.noteSeen(b);
+        expect(wire.nodes[a]!.sweep().idleSessions, isEmpty);
+      }
       expect(wire.nodes[a]!.hasSession(b), isTrue);
+    });
+
+    test('a session nobody has heard from is dropped', () async {
+      // The bug this fixes: sessions were never removed, so every peer ever
+      // met stayed forever and kept being offered as a private recipient.
+      var now = DateTime(2026, 1, 1, 12);
+      final wire = await twoNodes(clock: () => now);
+      final ids = wire.nodes.keys.toList();
+      final (a, b) = (ids[0], ids[1]);
+
+      await wire.nodes[a]!.ensure(b);
+      await wire.deliverAll();
+      expect(wire.nodes[a]!.hasSession(b), isTrue);
+
+      now = now.add(const Duration(minutes: 5));
+      expect(wire.nodes[a]!.sweep().idleSessions, isEmpty);
+
+      now = now.add(const Duration(minutes: 10));
+      expect(wire.nodes[a]!.sweep().idleSessions, [b]);
+      expect(wire.nodes[a]!.hasSession(b), isFalse);
+    });
+
+    test('a relayed peer stays fresh without ever sending a hello', () async {
+      // A hello is per link and never relayed, so a peer two hops away never
+      // sends one. Freshness has to come from any traffic, or exactly the
+      // sessions that only work through a relay would be the ones expired.
+      var now = DateTime(2026, 1, 1, 12);
+      final wire = await twoNodes(clock: () => now);
+      final ids = wire.nodes.keys.toList();
+      final (a, b) = (ids[0], ids[1]);
+
+      await wire.nodes[a]!.ensure(b);
+      await wire.deliverAll();
+
+      now = now.add(const Duration(minutes: 9));
+      // A sealed message arriving is evidence enough.
+      final sealed = await wire.nodes[b]!.seal(a, 'still here'.codeUnits);
+      await wire.nodes[a]!.open(b, sealed!.counter, sealed.ciphertext);
+      wire.nodes[a]!.noteSeen(b);
+
+      now = now.add(const Duration(minutes: 9));
+      expect(wire.nodes[a]!.sweep().idleSessions, isEmpty);
+      expect(wire.nodes[a]!.hasSession(b), isTrue);
+    });
+
+    test('a handshake step counts as having seen the peer', () async {
+      var now = DateTime(2026, 1, 1, 12);
+      final wire = await twoNodes(clock: () => now);
+      final ids = wire.nodes.keys.toList();
+      final (a, b) = (ids[0], ids[1]);
+
+      await wire.nodes[a]!.ensure(b);
+      await wire.deliverAll();
+
+      now = now.add(const Duration(minutes: 9));
+      // Anything from them, even a step that goes nowhere.
+      await wire.nodes[a]!.handleStep(b, 1, Uint8List(48));
+
+      now = now.add(const Duration(minutes: 9));
+      expect(wire.nodes[a]!.sweep().idleSessions, isEmpty);
+    });
+  });
+
+  group('the session cap', () {
+    test('holds at the limit, dropping the least recently seen', () async {
+      // Same reasoning as the fragment assembler: a bound never reached in
+      // normal use is still what separates a busy day from an app that grows
+      // until it is killed.
+      var now = DateTime(2026, 1, 1, 12);
+
+      final hubKey = await X25519().newKeyPair();
+      final hubId = await SessionManager.peerIdFor(
+        (await hubKey.extractPublicKey()).bytes,
+      );
+
+      // [from, to, step, body], held rather than delivered, so the exchange is
+      // deterministic instead of racing on the event loop.
+      final queue = <(String, String, int, Uint8List)>[];
+      final peers = <String, SessionManager>{};
+
+      final hub = SessionManager(
+        peerId: hubId,
+        staticKeyPair: hubKey,
+        maxSessions: 4,
+        clock: () => now,
+        onStep: (dest, step, body) => queue.add((hubId, dest, step, body)),
+      );
+
+      Future<void> drain() async {
+        while (queue.isNotEmpty) {
+          final (from, to, step, body) = queue.removeAt(0);
+          final target = to == hubId ? hub : peers[to];
+          await target?.handleStep(from, step, body);
+        }
+      }
+
+      final order = <String>[];
+      for (var i = 0; i < 6; i++) {
+        final key = await X25519().newKeyPair();
+        final id = await SessionManager.peerIdFor(
+          (await key.extractPublicKey()).bytes,
+        );
+        order.add(id);
+        peers[id] = SessionManager(
+          peerId: id,
+          staticKeyPair: key,
+          clock: () => now,
+          onStep: (dest, step, body) => queue.add((id, dest, step, body)),
+        );
+
+        await peers[id]!.ensure(hubId);
+        await drain();
+        now = now.add(const Duration(minutes: 1));
+      }
+
+      expect(hub.establishedPeers.length, 4);
+      // The two oldest went, the newest stayed.
+      expect(hub.hasSession(order[0]), isFalse);
+      expect(hub.hasSession(order[1]), isFalse);
+      expect(hub.hasSession(order[5]), isTrue);
     });
   });
 }

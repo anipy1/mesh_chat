@@ -42,6 +42,8 @@ class SessionManager {
     this.onEstablished,
     this.onFailed,
     this.handshakeTimeout = const Duration(seconds: 20),
+    this.sessionIdleTimeout = const Duration(minutes: 10),
+    this.maxSessions = 32,
     DateTime Function()? clock,
   })  : _static = staticKeyPair,
         _onStep = onStep,
@@ -62,10 +64,33 @@ class SessionManager {
   /// unable to ever try again.
   final Duration handshakeTimeout;
 
+  /// How long a session is kept after the last sign of the peer.
+  ///
+  /// Not reachability: a session deliberately outlives the link it was made
+  /// on, and one that only works through a relay is still a good session. This
+  /// is about silence. Re-establishing costs three small frames, and keeping
+  /// every peer ever met costs memory forever and makes the app offer private
+  /// messages to people who left hours ago.
+  final Duration sessionIdleTimeout;
+
+  /// Ceiling on live sessions. The least recently seen goes first.
+  ///
+  /// Same reasoning as the fragment assembler: a bound that is never reached
+  /// in normal use is still the difference between a busy day and an app that
+  /// grows until it is killed.
+  final int maxSessions;
+
   final DateTime Function() _now;
 
   final Map<String, NoiseTransport> _sessions = {};
   final Map<String, _Pending> _pending = {};
+
+  /// When we last had any evidence a peer is still out there.
+  ///
+  /// Any evidence, not just a hello. A hello is per link and never relayed, so
+  /// a peer two hops away never sends us one, and freshness based on helloes
+  /// alone would expire exactly the sessions that only work through a relay.
+  final Map<String, DateTime> _lastSeen = {};
 
   Iterable<String> get establishedPeers => _sessions.keys;
 
@@ -87,23 +112,62 @@ class SessionManager {
   void forget(String peer) {
     _sessions.remove(peer);
     _pending.remove(peer);
+    _lastSeen.remove(peer);
   }
 
-  /// Abandons handshakes that have gone quiet, so they can be retried.
+  /// Records that [peer] is still out there.
   ///
-  /// Returns the peers that were given up on.
-  List<String> expire() {
+  /// Called for anything that could only have come from them: a hello, a
+  /// handshake step, or a sealed message that actually opened.
+  void noteSeen(String peer) => _lastSeen[peer] = _now();
+
+  /// Drops handshakes that stalled and sessions that have gone silent.
+  SessionSweep sweep() {
     final now = _now();
-    final dead = <String>[];
+
+    final stalled = <String>[];
     _pending.removeWhere((peer, pending) {
       if (now.difference(pending.startedAt) < handshakeTimeout) return false;
-      dead.add(peer);
+      stalled.add(peer);
       return true;
     });
-    for (final peer in dead) {
+    for (final peer in stalled) {
       onFailed?.call(peer, SessionFailure.timeout);
     }
-    return dead;
+
+    final idle = <String>[];
+    for (final peer in _sessions.keys.toList()) {
+      final seen = _lastSeen[peer];
+      if (seen == null || now.difference(seen) >= sessionIdleTimeout) {
+        _sessions.remove(peer);
+        _lastSeen.remove(peer);
+        idle.add(peer);
+      }
+    }
+
+    return SessionSweep(stalledHandshakes: stalled, idleSessions: idle);
+  }
+
+  /// Drops the least recently seen session, when there are too many.
+  void _enforceSessionCap() {
+    while (_sessions.length > maxSessions) {
+      String? oldest;
+      DateTime? oldestAt;
+      for (final peer in _sessions.keys) {
+        final seen = _lastSeen[peer];
+        if (seen == null) {
+          oldest = peer;
+          break;
+        }
+        if (oldestAt == null || seen.isBefore(oldestAt)) {
+          oldest = peer;
+          oldestAt = seen;
+        }
+      }
+      if (oldest == null) return;
+      _sessions.remove(oldest);
+      _lastSeen.remove(oldest);
+    }
   }
 
   Future<void> _beginAsInitiator(String peer) async {
@@ -119,6 +183,7 @@ class SessionManager {
   /// Feeds one received handshake step in.
   Future<void> handleStep(String from, int step, Uint8List body) async {
     if (from == peerId) return;
+    noteSeen(from);
 
     var pending = _pending[from];
 
@@ -213,6 +278,8 @@ class SessionManager {
       handshakeHash: pending.state.handshakeHash,
       remoteStaticKey: remote,
     );
+    noteSeen(peer);
+    _enforceSessionCap();
     onEstablished?.call(peer, pending.initiator ? 'initiator' : 'responder');
   }
 
@@ -240,6 +307,19 @@ class SessionManager {
     }
     return out.toString();
   }
+}
+
+/// What one sweep threw away.
+class SessionSweep {
+  const SessionSweep({
+    required this.stalledHandshakes,
+    required this.idleSessions,
+  });
+
+  final List<String> stalledHandshakes;
+  final List<String> idleSessions;
+
+  bool get isEmpty => stalledHandshakes.isEmpty && idleSessions.isEmpty;
 }
 
 class _Pending {
