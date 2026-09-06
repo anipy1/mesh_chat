@@ -136,6 +136,53 @@ void main() {
     });
   });
 
+  group('announce', () {
+    const id = '0123456789abcdef';
+
+    test('round trips', () {
+      final parsed = Announce.parse(Frame.decode(Frame.announce(id).encode())!);
+      expect(parsed!.peerId, id);
+    });
+
+    test('is tiny, because it repeats forever', () {
+      expect(Frame.announce(id).encode().length, 22);
+    });
+
+    test('floods with the normal hop budget', () {
+      // It has to reach past the first hop, which is the entire point.
+      expect(Frame.announce(id).ttl, Frame.defaultTtl);
+      expect(Frame.forwarded(Frame.announce(id).encode()), isNotNull);
+    });
+
+    test('carries its own label', () {
+      final parsed = Announce.parse(Frame.announce(id))!;
+      expect(parsed.label.length, 4);
+    });
+
+    test('is not mistaken for anything else', () {
+      final f = Frame.announce(id);
+      expect(f.isReadableText, isFalse);
+      expect(f.isFragment, isFalse);
+      expect(f.isHandshake, isFalse);
+      expect(f.isSealed, isFalse);
+      expect(f.isAnnounce, isTrue);
+    });
+
+    test('a text frame is not mistaken for an announce', () {
+      expect(Announce.parse(Frame.text('hello')), isNull);
+    });
+
+    test('a payload too short to hold an id is refused', () {
+      final truncated = Frame(
+        envelopeVer: 1,
+        ttl: 3,
+        msgId: '0011223344556677',
+        payload: Uint8List.fromList([1, Frame.typeAnnounce, 9, 9]),
+      );
+      expect(Announce.parse(truncated), isNull);
+    });
+  });
+
   group('directed frames', () {
     const dest = '0123456789abcdef';
     const src = 'fedcba9876543210';

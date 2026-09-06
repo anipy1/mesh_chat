@@ -102,6 +102,13 @@ class MeshLink {
   /// a session tied to one dies with it.
   late final SessionManager _sessions;
 
+  /// Tells the mesh we exist, so peers that are not neighbours can find us.
+  Timer? _announceTimer;
+
+  /// Peers we have heard announce themselves, whether or not we have a leg to
+  /// them. This is how a node beyond the first hop becomes addressable at all.
+  final Set<String> _announced = {};
+
   /// Sweeps handshakes that stalled. Nothing acknowledges a handshake step, so
   /// a lost one would otherwise leave a pair unable to ever try again.
   Timer? _sessionSweep;
@@ -270,7 +277,8 @@ class MeshLink {
   /// Distinct peers, by node id. Counting transport legs double-counts on
   /// Android, where a Central and a Peripheral for the same device both derive
   /// their uuid from the same MAC and are therefore the same key.
-  Set<String> get knownPeers => {..._outPeerId.values, ..._inPeerId.values};
+  Set<String> get knownPeers =>
+      {..._outPeerId.values, ..._inPeerId.values, ..._announced};
 
   List<String> get peerLabels => [
         ..._links.keys.map(
@@ -570,6 +578,7 @@ class MeshLink {
       );
       _running = true;
       _startSessionSweep();
+      _startAnnouncing();
     } catch (e) {
       // Android error code 1 is SCAN_FAILED_ALREADY_STARTED: the scan we want
       // is running, so this is success wearing an exception.
@@ -615,6 +624,9 @@ class MeshLink {
     _retiredKeys.clear();
     _sessionSweep?.cancel();
     _sessionSweep = null;
+    _announceTimer?.cancel();
+    _announceTimer = null;
+    _announced.clear();
     _assembler.clear();
     _connected.clear();
     try {
@@ -932,6 +944,29 @@ class MeshLink {
       return;
     }
 
+    // Somebody saying they exist. Deliberately not cancelled from the relay:
+    // unlike an addressed frame this has not "arrived" anywhere, and the whole
+    // job is to keep going so the far side of the mesh hears it too.
+    if (frame.isAnnounce) {
+      final announce = Announce.parse(frame);
+      if (announce == null) {
+        _log(LogLevel.warn, 'malformed announce from $peer -- dropped');
+        return;
+      }
+      if (announce.peerId == identity.peerId) return;
+      if (_announced.add(announce.peerId)) {
+        _log(LogLevel.info, 'discovered ${announce.label}');
+      }
+      // An announce reaches us through relays, so it is evidence about peers a
+      // hello can never tell us anything about, both that they exist and that
+      // they are still alive.
+      _sessions.noteSeen(announce.peerId);
+      if (!_isBlockedId(announce.peerId)) {
+        unawaited(_sessions.ensure(announce.peerId));
+      }
+      return;
+    }
+
     // Addressed traffic. Relaying already happened above, exactly as for any
     // other frame, because a relay cannot tell these apart and does not need
     // to. What is left is deciding whether this one is ours.
@@ -1085,6 +1120,22 @@ class MeshLink {
   /// Nothing acknowledges a handshake step. It floods like any other frame and
   /// can simply be lost, and without this a single lost step would leave a pair
   /// unable to ever form a session.
+  /// Announces us now and then keeps announcing.
+  ///
+  /// Repeating matters as much as the first one: a node that joins later has
+  /// no way to ask who is out there, so the mesh has to keep saying.
+  void _startAnnouncing() {
+    _announceTimer?.cancel();
+    unawaited(_announce());
+    _announceTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => unawaited(_announce()),
+    );
+  }
+
+  Future<void> _announce() =>
+      _flood(Frame.announce(identity.peerId), 'announce');
+
   void _startSessionSweep() {
     _sessionSweep?.cancel();
     _sessionSweep = Timer.periodic(const Duration(seconds: 5), (_) {
@@ -1794,6 +1845,7 @@ class MeshLink {
 
   Future<void> dispose() async {
     _sessionSweep?.cancel();
+    _announceTimer?.cancel();
     for (final r in _pendingRelays.values) {
       r.timer?.cancel();
     }

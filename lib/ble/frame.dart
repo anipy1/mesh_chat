@@ -27,6 +27,7 @@ class Frame {
   static const typeFragment = 3;
   static const typeHandshake = 4;
   static const typeSealed = 5;
+  static const typeAnnounce = 6;
 
   /// Hop budget a fresh message starts with. A receiver turns the ttl it
   /// sees back into a hop count: hops = defaultTtl - ttl.
@@ -53,6 +54,9 @@ class Frame {
 
   /// Addressing plus the handshake step number.
   static const handshakeHeaderLength = addressLength + 1;
+
+  /// Just a peer id.
+  static const announceLength = 8;
 
   /// Addressing plus the 8 byte transport counter.
   static const sealedHeaderLength = addressLength + 8;
@@ -109,6 +113,8 @@ class Frame {
 
   bool get isSealed => innerVer == innerVersion && type == typeSealed;
 
+  bool get isAnnounce => innerVer == innerVersion && type == typeAnnounce;
+
   static final _rnd = Random.secure();
 
   /// Announces our node id on one link. The advertised name cannot carry this:
@@ -119,6 +125,33 @@ class Frame {
 
   factory Frame.text(String message, {int ttl = defaultTtl}) =>
       _build(typeText, message, ttl);
+
+  /// Says "this peer id exists and is alive", to the whole mesh.
+  ///
+  /// A hello does the same job for one link and is never relayed, which left a
+  /// gap: a node could only ever start a session with a peer it was directly
+  /// adjacent to. Sessions relay fine once they exist, but nothing was
+  /// discovering the peers that were never neighbours in the first place.
+  ///
+  /// Ordinary relayable traffic, so it floods, dedupes and damps like anything
+  /// else, and costs 22 bytes.
+  ///
+  /// It does put every peer id on the air for anyone in range to collect,
+  /// rather than only telling immediate neighbours. That is a real cost and it
+  /// is the same trade bitchat makes: without it the mesh cannot introduce
+  /// peers to each other at all.
+  factory Frame.announce(String peerId, {int ttl = defaultTtl}) {
+    final payload = Uint8List(2 + announceLength);
+    payload[0] = innerVersion;
+    payload[1] = typeAnnounce;
+    _writeId(payload, 2, peerId);
+    return Frame(
+      envelopeVer: envelopeVersion,
+      ttl: ttl,
+      msgId: _newMsgId(),
+      payload: payload,
+    );
+  }
 
   /// One step of a Noise handshake, addressed to a particular peer.
   ///
@@ -340,6 +373,22 @@ class Frame {
 /// Everything is validated here, before a single byte is buffered. A peer that
 /// claims 60000 pieces or an index past the end gets rejected at parse time
 /// rather than after we have allocated something on its behalf.
+/// A peer announcing itself, once it has been checked.
+class Announce {
+  const Announce(this.peerId);
+
+  final String peerId;
+
+  String get label => _labelOf(peerId);
+
+  static Announce? parse(Frame frame) {
+    if (!frame.isAnnounce) return null;
+    final p = frame.payload;
+    if (p.length < 2 + Frame.announceLength) return null;
+    return Announce(Frame._readId(p, 2));
+  }
+}
+
 /// A handshake step as it arrived, once it has been checked.
 ///
 /// Everything is validated before anything is allocated. These frames come off
