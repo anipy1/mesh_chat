@@ -126,16 +126,22 @@ class _HomePageState extends State<HomePage> {
     final text = _input.text.trim();
     if (text.isEmpty) return;
     final to = _recipient;
+    // Whether this is actually sealed right now, or only will be. Showing a
+    // padlock on a message still waiting for a handshake would claim something
+    // that is not true yet.
+    final ready = to != null && _link.sessionPeers.contains(to);
     _input.clear();
     setState(() {
       _chat.add(
         ChatEntry(
           text: text,
           mine: true,
-          sealed: to != null,
+          sealed: ready,
           detail: to == null
               ? '${_link.outboundPeers} out · ${_link.subscribedCentrals} sub'
-              : 'sealed to ${MeshLink.labelOf(to)}',
+              : ready
+                  ? 'sealed to ${MeshLink.labelOf(to)}'
+                  : 'held for ${MeshLink.labelOf(to)}, no session yet',
         ),
       );
     });
@@ -376,7 +382,7 @@ class _HomePageState extends State<HomePage> {
           // Who the next message goes to. Only peers with a live session can be
           // picked: without one there is nothing to seal with, and offering a
           // peer we cannot actually reach privately would be a lie.
-          if (running && _link.sessionPeers.isNotEmpty)
+          if (running && _link.addressablePeers.isNotEmpty)
             SizedBox(
               height: 44,
               child: ListView(
@@ -391,16 +397,34 @@ class _HomePageState extends State<HomePage> {
                       onSelected: (_) => setState(() => _recipient = null),
                     ),
                   ),
-                  for (final peer in _link.sessionPeers)
+                  for (final peer in _link.addressablePeers)
                     Padding(
                       padding: const EdgeInsets.only(right: 6, top: 6),
-                      child: ChoiceChip(
-                        avatar: const Icon(Icons.lock, size: 14),
-                        label: Text(MeshLink.labelOf(peer)),
-                        selected: _recipient == peer,
-                        onSelected: (_) => setState(
-                          () => _recipient = _recipient == peer ? null : peer,
-                        ),
+                      child: Builder(
+                        builder: (context) {
+                          // A padlock means the words are already unreadable to
+                          // everyone else. A clock means they will be, once the
+                          // handshake finishes. Showing the same icon for both
+                          // would be claiming something that is not true yet.
+                          final ready = _link.sessionPeers.contains(peer);
+                          final held = _link.heldFor(peer);
+                          return ChoiceChip(
+                            avatar: Icon(
+                              ready ? Icons.lock : Icons.schedule,
+                              size: 14,
+                            ),
+                            label: Text(
+                              held > 0
+                                  ? '${MeshLink.labelOf(peer)} ($held)'
+                                  : MeshLink.labelOf(peer),
+                            ),
+                            selected: _recipient == peer,
+                            onSelected: (_) => setState(
+                              () =>
+                                  _recipient = _recipient == peer ? null : peer,
+                            ),
+                          );
+                        },
                       ),
                     ),
                 ],

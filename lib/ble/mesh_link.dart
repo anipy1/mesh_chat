@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart';
 
 import 'fragment_assembler.dart';
 import 'frame.dart';
+import 'outbox.dart';
 import '../identity/identity_store.dart';
 import '../identity/node_identity.dart';
 import '../noise/noise_protocol.dart';
@@ -82,10 +83,13 @@ class MeshLink {
       peerId: identity.peerId,
       staticKeyPair: identity.noiseKeyPair,
       onStep: _emitHandshakeStep,
-      onEstablished: (peer, role) => _log(
-        LogLevel.info,
-        'session with ${labelOf(peer)} established ($role)',
-      ),
+      onEstablished: (peer, role) {
+        _log(
+          LogLevel.info,
+          'session with ${labelOf(peer)} established ($role)',
+        );
+        unawaited(_flushOutbox(peer));
+      },
       onFailed: (peer, why) => _log(
         LogLevel.warn,
         'session with ${labelOf(peer)} failed: ${why.name}',
@@ -101,6 +105,10 @@ class MeshLink {
   /// Keyed on peer id rather than on a link, because legs churn constantly and
   /// a session tied to one dies with it.
   late final SessionManager _sessions;
+
+  /// Messages waiting for a session, kept as plaintext so they can be sealed
+  /// against whatever session exists when the peer finally turns up.
+  final Outbox _outbox = Outbox();
 
   /// Tells the mesh we exist, so peers that are not neighbours can find us.
   Timer? _announceTimer;
@@ -267,8 +275,27 @@ class MeshLink {
   bool get running => _running;
   BluetoothLowEnergyState get state => _central.state;
 
+  /// How many messages are waiting for a session, across all peers.
+  int get heldMessages => _outbox.messageCount;
+
+  /// How many are waiting for one peer.
+  int heldFor(String peer) => _outbox.pendingFor(peer);
+
   /// Peers we hold a live Noise session with, so can send a sealed message to.
   List<String> get sessionPeers => _sessions.establishedPeers.toList()..sort();
+
+  /// Everyone we could address, whether or not a session exists yet.
+  ///
+  /// A peer without a session is still worth offering: the message waits and
+  /// goes out when the handshake finishes. That is a different promise from
+  /// "this is private right now", so the UI has to show the two apart, but it
+  /// is not a false one.
+  List<String> get addressablePeers {
+    final all = <String>{...sessionPeers, ...knownPeers}
+      ..remove(identity.peerId)
+      ..removeWhere(_isBlockedId);
+    return all.toList()..sort();
+  }
 
   int get outboundPeers => _links.length;
   int get inboundPeers => _centrals.length;
@@ -627,6 +654,7 @@ class MeshLink {
     _announceTimer?.cancel();
     _announceTimer = null;
     _announced.clear();
+    _outbox.clear();
     _assembler.clear();
     _connected.clear();
     try {
@@ -672,7 +700,15 @@ class MeshLink {
   /// cannot read. Only [peer] can open it.
   Future<void> sendSealed(String peer, String text) async {
     if (!_sessions.hasSession(peer)) {
-      _log(LogLevel.warn, 'no session with ${labelOf(peer)} yet');
+      // Held rather than dropped. Typing to a peer before the handshake
+      // finishes used to lose the message entirely, with nothing but a warning
+      // in a log pane nobody reads.
+      _outbox.add(peer, text);
+      _log(
+        LogLevel.info,
+        'no session with ${labelOf(peer)} yet -- '
+        '${_outbox.pendingFor(peer)} waiting',
+      );
       await _sessions.ensure(peer);
       return;
     }
@@ -687,6 +723,23 @@ class MeshLink {
       ),
       'sealed to ${labelOf(peer)}',
     );
+  }
+
+  /// Sends everything that was waiting for this peer.
+  ///
+  /// Sealed one at a time against the session that exists now, which is the
+  /// point: the message that was typed twenty minutes ago goes out under
+  /// today's keys rather than the ones it would have used then.
+  Future<void> _flushOutbox(String peer) async {
+    final waiting = _outbox.take(peer);
+    if (waiting.isEmpty) return;
+    _log(
+      LogLevel.info,
+      'sending ${waiting.length} held message(s) to ${labelOf(peer)}',
+    );
+    for (final text in waiting) {
+      await sendSealed(peer, text);
+    }
   }
 
   /// Puts one handshake step on the mesh. Relayable, so it can reach a peer
@@ -1136,6 +1189,12 @@ class MeshLink {
       }
       for (final peer in swept.idleSessions) {
         _log(LogLevel.info, 'session with ${labelOf(peer)} went idle');
+      }
+      for (final entry in _outbox.expire().entries) {
+        _log(
+          LogLevel.warn,
+          'gave up on ${entry.value} message(s) for ${labelOf(entry.key)}',
+        );
       }
     });
   }
