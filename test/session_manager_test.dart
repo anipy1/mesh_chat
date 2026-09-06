@@ -154,6 +154,33 @@ void main() {
       expect(wire.established[higher]!.single, endsWith(':responder'));
     });
 
+    test('a lost opener from the winner does not deadlock the pair', () async {
+      // Seen on real phones. Both opened at once, the lower id won the tie
+      // break, and its own step 0 was lost on the radio. The loser waited for
+      // a reply that would never come because the winner was ignoring its
+      // opener, and the winner waited for a reply to a message that never
+      // arrived. Nobody moved until the handshake timeout fired.
+      final wire = await twoNodes();
+      final ids = wire.nodes.keys.toList()..sort();
+      final (lower, higher) = (ids[0], ids[1]);
+
+      await wire.nodes[lower]!.ensure(higher);
+      await wire.nodes[higher]!.ensure(lower);
+
+      // Throw away the winner's opener before it can be delivered.
+      final lost = wire.steps.indexWhere(
+        (s) => s.from == lower && s.step == 0,
+      );
+      expect(lost, isNot(-1));
+      wire.steps.removeAt(lost);
+
+      await wire.deliverAll();
+
+      expect(wire.nodes[lower]!.hasSession(higher), isTrue);
+      expect(wire.nodes[higher]!.hasSession(lower), isTrue);
+      expect(wire.failures, isEmpty);
+    });
+
     test('both sides agree on the same transcript', () async {
       // If a collision left them on different transcripts they would each
       // think they had a session and be unable to talk.

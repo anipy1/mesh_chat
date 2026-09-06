@@ -176,8 +176,14 @@ class SessionManager {
       initiator: true,
       staticKeyPair: _static,
     );
-    _pending[peer] = _Pending(state, initiator: true, startedAt: _now());
-    _onStep(peer, 0, await state.writeMessage());
+    final opening = await state.writeMessage();
+    _pending[peer] = _Pending(
+      state,
+      initiator: true,
+      startedAt: _now(),
+      opening: opening,
+    );
+    _onStep(peer, 0, opening);
   }
 
   /// Feeds one received handshake step in.
@@ -194,16 +200,36 @@ class SessionManager {
         // Both of us opened at once. The lower id initiates, the same tie
         // break used for dialling, so exactly one attempt survives.
         if (peerId.compareTo(from) < 0) {
-          // We win. Their attempt will be abandoned when our step 0 reaches
-          // them, so there is nothing to do here.
+          // We win, so their attempt is abandoned once our own step 0 reaches
+          // them. Send it again rather than assuming it already has.
+          //
+          // Staying silent here deadlocked a real pair for the full handshake
+          // timeout. Our opener was lost on the radio, so they never saw it and
+          // kept waiting for a reply to theirs, which we were ignoring because
+          // we had won. Nobody could move until the clock ran out. Re-sending
+          // costs 63 bytes and removes the only case where both sides wait for
+          // each other.
+          final opening = pending.opening;
+          if (opening != null) _onStep(from, 0, opening);
           return;
         }
         // We lose, so our own attempt goes and we answer theirs.
         _pending.remove(from);
         pending = null;
       } else if (pending != null) {
-        // They restarted mid handshake. Start over from their new opening
-        // rather than trying to continue a conversation they have forgotten.
+        // The same opening arriving twice is not a restart. The other side
+        // re-sends it after winning a tie break, because it cannot tell
+        // whether its first one was lost. Answering again with the reply we
+        // already made keeps both sides on one handshake; starting over would
+        // hand them a new ephemeral while they are still waiting on the old
+        // one.
+        final seen = pending.openingReceived;
+        final reply = pending.reply;
+        if (seen != null && reply != null && _sameBytes(seen, body)) {
+          _onStep(from, 1, reply);
+          return;
+        }
+        // A genuinely different opening means they really did start over.
         _pending.remove(from);
         pending = null;
       }
@@ -216,12 +242,19 @@ class SessionManager {
         initiator: false,
         staticKeyPair: _static,
       );
-      final fresh = _Pending(state, initiator: false, startedAt: _now());
+      final fresh = _Pending(
+        state,
+        initiator: false,
+        startedAt: _now(),
+        openingReceived: Uint8List.fromList(body),
+      );
       _pending[from] = fresh;
 
       try {
         await state.readMessage(body);
-        _onStep(from, 1, await state.writeMessage());
+        final reply = await state.writeMessage();
+        fresh.reply = reply;
+        _onStep(from, 1, reply);
       } on NoiseError {
         _pending.remove(from);
         onFailed?.call(from, SessionFailure.badMessage);
@@ -322,10 +355,38 @@ class SessionSweep {
   bool get isEmpty => stalledHandshakes.isEmpty && idleSessions.isEmpty;
 }
 
+bool _sameBytes(List<int> a, List<int> b) {
+  if (a.length != b.length) return false;
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
 class _Pending {
-  _Pending(this.state, {required this.initiator, required this.startedAt});
+  _Pending(
+    this.state, {
+    required this.initiator,
+    required this.startedAt,
+    this.opening,
+    this.openingReceived,
+  });
 
   final HandshakeState state;
   final bool initiator;
   final DateTime startedAt;
+
+  /// The step 0 we sent, kept so it can be sent again.
+  ///
+  /// Only an initiator has one. writeMessage advances the handshake, so the
+  /// bytes have to be held rather than regenerated.
+  final Uint8List? opening;
+
+  /// The step 0 we received, kept so a repeat can be recognised as a repeat
+  /// rather than mistaken for the peer starting over.
+  final Uint8List? openingReceived;
+
+  /// The step 1 we replied with, kept so it can be sent again if the peer
+  /// repeats its opening.
+  Uint8List? reply;
 }
