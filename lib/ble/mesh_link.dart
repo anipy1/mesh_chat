@@ -562,9 +562,29 @@ class MeshLink {
         // advertisement.
         final advertisedName =
             Platform.isAndroid ? null : '$kNamePrefix$nodeId';
-        await _peripheral.startAdvertising(
-          Advertisement(name: advertisedName, serviceUUIDs: [_serviceUuid]),
-        );
+        final advertisement =
+            Advertisement(name: advertisedName, serviceUUIDs: [_serviceUuid]);
+        try {
+          await _peripheral.startAdvertising(advertisement);
+        } catch (e) {
+          // Android error code 3 is ADVERTISE_FAILED_ALREADY_STARTED, and it
+          // usually means a previous process of this app is still advertising.
+          // A process that is killed rather than stopped, by a cancelled
+          // install or by the system, never runs its teardown, and the
+          // advertiser it registered outlives it. The new process then starts
+          // up believing it is stopped, which it is, while the phone is still
+          // broadcasting on its behalf.
+          //
+          // Stop that one and try again. The same reasoning as the scan path
+          // below, which already treats an already-running scan as ours.
+          if (!e.toString().contains('error code: 3')) rethrow;
+          _log(
+            LogLevel.warn,
+            'advertising was already running -- stopping it and retrying',
+          );
+          await _peripheral.stopAdvertising();
+          await _peripheral.startAdvertising(advertisement);
+        }
         _log(
           LogLevel.info,
           advertisedName == null
