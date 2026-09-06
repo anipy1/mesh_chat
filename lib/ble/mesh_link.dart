@@ -941,6 +941,12 @@ class MeshLink {
   }
 
   void _handleInbound(Uint8List bytes, String via, String key) {
+    // Stopped means off the mesh. The platform listeners stay wired until
+    // dispose, so a peer that still holds a GATT connection can keep writing
+    // to us long after the user pressed Stop, and without this a stopped node
+    // goes on decoding, deduping and relaying other people's traffic.
+    if (!_running) return;
+
     // A blocked peer is treated as unreachable in both directions. Accepting
     // its frames while refusing to send would not be a partition.
     if (_isBlockedKey(key)) return;
@@ -1624,6 +1630,10 @@ class MeshLink {
   }
 
   Future<void> _onDiscovered(DiscoveredEventArgs e) async {
+    // Same reasoning as the inbound path: a scan result arriving after Stop
+    // must not start a new connection.
+    if (!_running) return;
+
     final key = '${e.peripheral.uuid}';
 
     String? advertisedName;
