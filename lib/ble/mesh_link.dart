@@ -612,6 +612,10 @@ class MeshLink {
       if (e.toString().contains('error code: 1')) {
         _log(LogLevel.warn, 'scan was already running -- treating as started');
         _running = true;
+        // Same as the success path. Skipping these left a node that resumed
+        // this way scanning happily and never announcing or sweeping again.
+        _startSessionSweep();
+        _startAnnouncing();
       } else {
         _log(LogLevel.error, 'startDiscovery failed: ${_brief(e)}');
       }
@@ -620,13 +624,43 @@ class MeshLink {
 
   Future<void> stop() async {
     _wantRunning = false;
-    if (!_running) return;
+    // No early return on !_running. Anything that clears _running without
+    // tearing down, such as the adapter dropping, used to leave this method
+    // with nothing to do while timers kept firing and the radio kept
+    // advertising, and the only way out was to kill the app. Teardown is
+    // idempotent, so doing it twice is cheaper than skipping it once.
     _running = false;
-    for (final link in _links.values) {
-      try {
-        await _central.disconnect(link.peripheral);
-      } catch (_) {}
+    await _teardown(releaseRadio: true);
+    _log(LogLevel.info, 'stopped');
+  }
+
+  /// Puts everything back to a stopped state.
+  ///
+  /// [releaseRadio] is false when the adapter itself has gone: there is nothing
+  /// to disconnect from and nothing to stop advertising, and asking would only
+  /// produce errors about a radio that is already off.
+  Future<void> _teardown({required bool releaseRadio}) async {
+    _announceTimer?.cancel();
+    _announceTimer = null;
+    _sessionSweep?.cancel();
+    _sessionSweep = null;
+    for (final t in _pruneTimers.values) {
+      t.cancel();
     }
+    _pruneTimers.clear();
+    for (final r in _pendingRelays.values) {
+      r.timer?.cancel();
+    }
+    _pendingRelays.clear();
+
+    if (releaseRadio) {
+      for (final link in _links.values) {
+        try {
+          await _central.disconnect(link.peripheral);
+        } catch (_) {}
+      }
+    }
+
     _links.clear();
     _dialling.clear();
     _centrals.clear();
@@ -636,27 +670,18 @@ class MeshLink {
     _yieldedTo.clear();
     _yieldedKeys.clear();
     _helloSent.clear();
-    for (final t in _pruneTimers.values) {
-      t.cancel();
-    }
-    _pruneTimers.clear();
     _backoffUntil.clear();
     _flaps.clear();
     _observed.clear();
-    for (final r in _pendingRelays.values) {
-      r.timer?.cancel();
-    }
-    _pendingRelays.clear();
     _linkWrites.clear();
     _retiredKeys.clear();
-    _sessionSweep?.cancel();
-    _sessionSweep = null;
-    _announceTimer?.cancel();
-    _announceTimer = null;
     _announced.clear();
     _outbox.clear();
     _assembler.clear();
     _connected.clear();
+
+    if (!releaseRadio) return;
+
     try {
       await _central.stopDiscovery();
     } catch (e) {
@@ -668,7 +693,6 @@ class MeshLink {
     } catch (e) {
       _log(LogLevel.warn, 'stopAdvertising: $e');
     }
-    _log(LogLevel.info, 'stopped');
   }
 
   Future<void> _authorize() async {
@@ -1483,13 +1507,11 @@ class MeshLink {
           _startStack();
         } else if (e.state != BluetoothLowEnergyState.poweredOn && _running) {
           // The links are gone with the radio; do not keep claiming to run.
+          // Timers have to go with them: leaving them running was how a node
+          // ended up announcing every 30 seconds while its own UI said it was
+          // stopped.
           _running = false;
-          _links.clear();
-          _dialling.clear();
-          _centrals.clear();
-          _notifyLimit.clear();
-          _outPeerId.clear();
-          _inPeerId.clear();
+          unawaited(_teardown(releaseRadio: false));
           _log(LogLevel.warn, 'adapter ${e.state.name} -- stack torn down');
         }
       },
