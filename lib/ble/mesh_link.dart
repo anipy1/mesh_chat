@@ -859,20 +859,11 @@ class MeshLink {
     // relayed, and never shown as messages.
     if (frame.isHello) {
       final peerId = frame.text;
-      if (via == 'notify') {
-        _outPeerId[key] = peerId;
-      } else {
-        _inPeerId[key] = peerId;
-      }
+      _identify(key, peerId, via);
       _cancelPrune(key);
       if (_isBlockedId(peerId)) {
         _log(LogLevel.warn,
             'hello from blocked ${labelOf(peerId)} -- dropping leg');
-        if (via == 'notify') {
-          _outPeerId[key] = peerId;
-        } else {
-          _inPeerId[key] = peerId;
-        }
         _dropPeer(peerId);
         return;
       }
@@ -1695,6 +1686,31 @@ class MeshLink {
       _notifyLimit.remove(key);
       _log(LogLevel.warn, 'central ${_short(key)} never said hello -- pruned');
     });
+  }
+
+  /// Records who a leg belongs to, and the other leg under the same key.
+  ///
+  /// On Android both GATT roles for one device derive their key from the same
+  /// MAC, so a hello arriving on either leg has identified both. Only one was
+  /// being recorded, which left the other unidentified for good, because a
+  /// hello arrives once per link and the second one never comes.
+  ///
+  /// That is worse than an untidy peer list. _sendTargets treats an
+  /// unidentified but subscribed inbound leg as its own anonymous peer, so it
+  /// escapes the per-peer dedupe and gets a second copy of every message,
+  /// delivered to a device that already received it on the other leg.
+  ///
+  /// The guard is what keeps this correct on darwin, where the two legs to one
+  /// device carry unrelated identifiers: the other role is simply never present
+  /// under the same key there, so nothing extra is recorded.
+  void _identify(String key, String peerId, String via) {
+    if (via == 'notify') {
+      _outPeerId[key] = peerId;
+      if (_centrals.containsKey(key)) _inPeerId[key] = peerId;
+    } else {
+      _inPeerId[key] = peerId;
+      if (_links.containsKey(key)) _outPeerId[key] = peerId;
+    }
   }
 
   void _cancelPrune(String key) => _pruneTimers.remove(key)?.cancel();
