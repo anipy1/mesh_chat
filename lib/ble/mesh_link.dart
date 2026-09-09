@@ -767,15 +767,46 @@ class MeshLink {
     }
     final sealed = await _sessions.seal(peer, SealedPayload.encodeText(text));
     if (sealed == null) return;
-    await _flood(
-      Frame.sealed(
-        dest: peer,
-        src: identity.peerId,
-        counter: sealed.counter,
-        ciphertext: sealed.ciphertext,
-      ),
-      'sealed to ${labelOf(peer)}',
+    final frame = Frame.sealed(
+      dest: peer,
+      src: identity.peerId,
+      counter: sealed.counter,
+      ciphertext: sealed.ciphertext,
     );
+    await _deliver(frame, peer, 'sealed');
+  }
+
+  /// Sends a sealed frame by whichever path can carry it.
+  ///
+  /// Radio first, always. It costs nothing, needs no infrastructure, and tells
+  /// a relay nothing. The internet is what happens when the radio cannot, not
+  /// a second copy of every message: sending both would double the traffic and
+  /// hand a relay a record of conversations that never needed to leave the
+  /// room.
+  Future<void> _deliver(Frame frame, String peer, String what) async {
+    if (reachableOnMesh(peer)) {
+      await _flood(frame, '$what to ${labelOf(peer)}');
+      return;
+    }
+
+    final address = _nostrAddresses[peer];
+    final send = nostrSend;
+    if (address != null && send != null) {
+      final bytes = frame.encode();
+      if (await send(address, bytes)) {
+        _log(
+          LogLevel.tx,
+          '$what ${frame.shortId} ${bytes.length}B to ${labelOf(peer)} '
+          'over nostr',
+        );
+        return;
+      }
+      _log(LogLevel.warn, 'nostr could not take ${frame.shortId}');
+    }
+
+    // Neither pipe. Fall back to flooding anyway: with no evidence either way
+    // a guess on the radio is better than dropping it, and it costs one frame.
+    await _flood(frame, '$what to ${labelOf(peer)}');
   }
 
   /// Tells a peer where to reach us when the radio cannot.
@@ -792,14 +823,15 @@ class MeshLink {
       SealedPayload.encodeNostrAddress(address),
     );
     if (sealed == null) return;
-    await _flood(
+    await _deliver(
       Frame.sealed(
         dest: peer,
         src: identity.peerId,
         counter: sealed.counter,
         ciphertext: sealed.ciphertext,
       ),
-      'nostr address to ${labelOf(peer)}',
+      peer,
+      'nostr address',
     );
   }
 
@@ -809,6 +841,25 @@ class MeshLink {
   /// Our own Nostr key, when the app has one. Set by whoever wires the
   /// internet transport; the mesh works perfectly well without it.
   String? nostrPublicKey;
+
+  /// Publishes a frame over the internet. Null until the bridge is attached.
+  ///
+  /// Returns whether it went. The mesh has no acknowledgements anywhere, so
+  /// this only reports that a relay was reachable, never that anyone read it.
+  Future<bool> Function(String recipientPubkey, Uint8List frame)? nostrSend;
+
+  /// Whether [peer] is somewhere the radio can plausibly reach.
+  ///
+  /// The honest answer available. Nothing in this mesh acknowledges anything,
+  /// so there is no way to know a flood arrived, and "we have peers" is not
+  /// the same as "we can reach this peer". What we do know is whether this
+  /// particular peer has been heard from: a leg labelled with them, or a
+  /// relayed announce. Absent both, flooding is a guess, and the internet is a
+  /// better one.
+  bool reachableOnMesh(String peer) {
+    if (_announced.contains(peer)) return true;
+    return _outPeerId.containsValue(peer) || _inPeerId.containsValue(peer);
+  }
 
   /// Sends everything that was waiting for this peer.
   ///
@@ -1289,6 +1340,20 @@ class MeshLink {
       }
     });
   }
+
+  /// Feeds a frame that arrived over the internet into the ordinary path.
+  ///
+  /// Deliberately the same path. A frame is a frame, and the dedupe, session
+  /// and reassembly logic should not care which pipe carried it. The key is a
+  /// fixed label rather than a transport id, since there is no leg here and
+  /// nothing to relay back onto.
+  void acceptFromNostr(Uint8List bytes) {
+    if (!_running) return;
+    _handleInbound(bytes, 'nostr', _nostrKey);
+  }
+
+  /// Stands in for a transport key on frames that came from a relay.
+  static const _nostrKey = 'nostr';
 
   /// Calls off a relay we queued before realising the frame was for us.
   ///
