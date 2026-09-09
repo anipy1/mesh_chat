@@ -1,0 +1,8 @@
+tags:
+  # Talks to a real relay over the internet. Skipped by default because a red
+  # suite should mean our code is wrong, not that somebody else's server was
+  # rebooting. Run it deliberately:
+  #
+  #   flutter test --tags live --run-skipped
+  live:
+    skip: "live relay; run with --tags live --run-skipped"
