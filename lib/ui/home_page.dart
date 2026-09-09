@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'package:flutter/material.dart';
@@ -7,6 +8,9 @@ import '../ble/frame.dart';
 import '../ble/link_ids.dart';
 import '../ble/mesh_link.dart';
 import '../identity/identity_store.dart';
+import '../identity/nostr_identity.dart';
+import '../nostr/nostr_bridge.dart';
+import '../nostr/relay_client.dart';
 
 class ChatEntry {
   ChatEntry({
@@ -95,6 +99,7 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
+    _stopBridge();
     _tick?.cancel();
     _logSub.cancel();
     _msgSub.cancel();
@@ -109,8 +114,12 @@ class _HomePageState extends State<HomePage> {
     try {
       if (_link.running || _link.wantRunning) {
         await _link.stop();
+        await _stopBridge();
       } else {
         await _link.start();
+        // After the radio, and not awaited into it: a slow relay must not hold
+        // up joining the mesh.
+        unawaited(_startBridge());
       }
     } catch (_) {
       // Already logged by MeshLink; the log pane is the source of truth.
@@ -121,6 +130,71 @@ class _HomePageState extends State<HomePage> {
 
   /// Who the next message is for, or null for everyone.
   String? _recipient;
+
+  /// The internet path, when it is up. Null whenever the mesh is stopped, or
+  /// when this build simply has no relay to talk to.
+  NostrIdentity? _nostr;
+  NostrBridge? _bridge;
+  StreamSubscription<Uint8List>? _bridgeSub;
+  StreamSubscription<bool>? _relaySub;
+  bool _relayUp = false;
+
+  /// One relay, and that is a real limitation rather than a simplification: it
+  /// is a single point of failure for the internet path, which is most of what
+  /// the internet path was for. Nostr practice is two or three. Chosen because
+  /// nos.lol serves gift wraps without demanding NIP-42, where relay.damus.io
+  /// refuses its own auth with a server side configuration error.
+  static final _relayUrl = Uri.parse('wss://nos.lol');
+
+  /// Brings up the internet path alongside the radio.
+  ///
+  /// Everything here is allowed to fail. The mesh is the product and it works
+  /// with no network at all, so a relay that cannot be reached should cost a
+  /// chip in the UI and nothing else.
+  Future<void> _startBridge() async {
+    if (_bridge != null) return;
+    try {
+      // The seed is already loaded for the mesh identity, and the Nostr key
+      // is the third thing derived from it. Nothing extra to store or unlock.
+      final nostr = await NostrIdentity.fromSeed(_link.identity.seed);
+      final bridge = NostrBridge(
+        identity: nostr,
+        client: RelayClient(_relayUrl, secretKey: nostr.privateKeyHex),
+      );
+
+      _nostr = nostr;
+      _bridge = bridge;
+      _link.nostrPublicKey = nostr.publicKeyHex;
+      _link.nostrSend = bridge.send;
+      _bridgeSub = bridge.inbound.listen(_link.acceptFromNostr);
+      _relaySub = bridge.client.connectionChanges.listen((up) {
+        if (mounted) setState(() => _relayUp = up);
+      });
+      bridge.start();
+      // Worth showing: this is the address peers will be told, and the only
+      // way to see it on a phone that is not plugged into anything.
+      _link.note('nostr identity ${nostr.shortNpub}');
+      _link.note('relay $_relayUrl');
+    } catch (_) {
+      // Logged nowhere on purpose: there is nothing a user can do about a
+      // relay being down, and the chip already says so.
+      await _stopBridge();
+    }
+  }
+
+  Future<void> _stopBridge() async {
+    _link.nostrSend = null;
+    _link.nostrPublicKey = null;
+    await _bridgeSub?.cancel();
+    await _relaySub?.cancel();
+    _bridgeSub = null;
+    _relaySub = null;
+    final bridge = _bridge;
+    _bridge = null;
+    _nostr = null;
+    if (mounted) setState(() => _relayUp = false);
+    await bridge?.close();
+  }
 
   Future<void> _send() async {
     final text = _input.text.trim();
@@ -293,7 +367,11 @@ class _HomePageState extends State<HomePage> {
       ),
       body: Column(
         children: [
-          _StatusStrip(link: _link),
+          _StatusStrip(
+            link: _link,
+            relayUp: _relayUp,
+            npub: _nostr?.shortNpub,
+          ),
           const Divider(height: 1),
           Expanded(
             flex: 3,
@@ -491,8 +569,21 @@ class _HomePageState extends State<HomePage> {
 }
 
 class _StatusStrip extends StatelessWidget {
-  const _StatusStrip({required this.link});
+  const _StatusStrip({
+    required this.link,
+    required this.relayUp,
+    this.npub,
+  });
   final MeshLink link;
+
+  /// Whether the internet path is up. Labelled "nostr" rather than "relay"
+  /// because this strip already has a relay counter, and that one counts mesh
+  /// hops, which is a different thing entirely.
+  final bool relayUp;
+
+  /// Our own npub, shortened. Shown rather than logged because it is the thing
+  /// a person would read out to someone, and a log line scrolls away.
+  final String? npub;
 
   @override
   Widget build(BuildContext context) {
@@ -524,9 +615,21 @@ class _StatusStrip extends StatelessWidget {
                     '${link.relayedCount + link.suppressedCount}',
                 ok: link.relayedCount > 0 || link.suppressedCount > 0,
               ),
+              _Chip(label: 'nostr ${relayUp ? 'up' : 'off'}', ok: relayUp),
               _Chip(label: 'env v${Frame.envelopeVersion}', ok: true),
             ],
           ),
+          if (npub != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              npub!,
+              style: TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 11,
+                color: scheme.onSurfaceVariant,
+              ),
+            ),
+          ],
           // Radio-visible peers, linked or not. For the control experiment this
           // is the line that matters: if C never shows up here, C is genuinely
           // out of range, and that is an observation rather than an inference.

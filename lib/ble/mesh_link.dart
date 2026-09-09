@@ -435,6 +435,12 @@ class MeshLink {
 
   List<LogLine> get history => List.unmodifiable(_history);
 
+  /// Puts a line in the log pane from outside.
+  ///
+  /// The pane is the only place anything can be read on a phone that is not
+  /// plugged into a laptop, so the internet path needs a way in.
+  void note(String text) => _log(LogLevel.info, text);
+
   void _log(LogLevel level, String text) {
     // Mirror to the platform log as well as the in-app pane. Reading a long
     // stack trace by scrolling a 480x640 screen is not a debugging strategy;
