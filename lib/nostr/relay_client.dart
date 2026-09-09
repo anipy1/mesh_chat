@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:nostr/nostr.dart';
 
 import 'relay_socket.dart';
+import 'relay_transport.dart';
 
 /// What a relay said about an event we published.
 class PublishResult {
@@ -25,7 +26,7 @@ class PublishResult {
 /// own rate limits, and none of that is exceptional enough to surface to a
 /// user. So a drop reconnects with backoff and re-sends the subscriptions,
 /// rather than being reported as an error.
-class RelayClient {
+class RelayClient implements RelayTransport {
   RelayClient(
     this.url, {
     RelaySocketFactory? connect,
@@ -77,19 +78,25 @@ class RelayClient {
   final _connected = StreamController<bool>.broadcast();
 
   /// Events the relay sent for any of our subscriptions.
+  @override
   Stream<Event> get events => _events.stream;
 
   /// One per published event, when the relay bothers to say.
+  @override
   Stream<PublishResult> get results => _results.stream;
 
   /// Anything the relay wants to tell a human. Worth surfacing: this is where
   /// rate limits and rejections get explained.
+  @override
   Stream<String> get notices => _notices.stream;
 
+  @override
   Stream<bool> get connectionChanges => _connected.stream;
 
+  @override
   bool get isConnected => _socket != null;
 
+  @override
   void open() {
     if (_closed) throw StateError('this client has been closed');
     _openSocket();
@@ -243,12 +250,14 @@ class RelayClient {
   bool get isAuthenticated => _authenticated;
 
   /// Publishes [event]. Returns immediately; watch [results] for the verdict.
+  @override
   void publish(Event event) => _send(event.serialize());
 
   /// Subscribes with [filters] and returns the subscription id.
   ///
   /// Recorded before sending, so a subscription asked for while disconnected
   /// still goes out when the socket comes back.
+  @override
   String subscribe(List<Filter> filters, {String? subscriptionId}) {
     final id = subscriptionId ?? generateRandomHex(bytes: 16);
     _subscriptions[id] = filters;
@@ -256,6 +265,7 @@ class RelayClient {
     return id;
   }
 
+  @override
   void unsubscribe(String subscriptionId) {
     _subscriptions.remove(subscriptionId);
     _send(Close(subscriptionId).serialize());
@@ -274,6 +284,7 @@ class RelayClient {
     }
   }
 
+  @override
   Future<void> close() async {
     _closed = true;
     _retry?.cancel();

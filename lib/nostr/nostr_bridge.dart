@@ -5,7 +5,7 @@ import 'dart:typed_data';
 import 'package:nostr/nostr.dart';
 
 import '../identity/nostr_identity.dart';
-import 'relay_client.dart';
+import 'relay_transport.dart';
 
 /// Carries mesh frames over the internet when the radio cannot.
 ///
@@ -23,7 +23,7 @@ class NostrBridge {
   NostrBridge({required this.identity, required this.client});
 
   final NostrIdentity identity;
-  final RelayClient client;
+  final RelayTransport client;
 
   /// Gift wrap. Relays that carry these usually want NIP-42 first.
   static const giftWrapKind = 1059;

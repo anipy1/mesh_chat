@@ -10,7 +10,7 @@ import '../ble/mesh_link.dart';
 import '../identity/identity_store.dart';
 import '../identity/nostr_identity.dart';
 import '../nostr/nostr_bridge.dart';
-import '../nostr/relay_client.dart';
+import '../nostr/relay_pool.dart';
 
 class ChatEntry {
   ChatEntry({
@@ -139,12 +139,20 @@ class _HomePageState extends State<HomePage> {
   StreamSubscription<bool>? _relaySub;
   bool _relayUp = false;
 
-  /// One relay, and that is a real limitation rather than a simplification: it
-  /// is a single point of failure for the internet path, which is most of what
-  /// the internet path was for. Nostr practice is two or three. Chosen because
-  /// nos.lol serves gift wraps without demanding NIP-42, where relay.damus.io
-  /// refuses its own auth with a server side configuration error.
-  static final _relayUrl = Uri.parse('wss://nos.lol');
+  /// Four relays, from four operators, so losing one changes nothing.
+  ///
+  /// Chosen by measurement rather than reputation: each of these was checked
+  /// to carry a gift wrap both ways, which is not the same as being a popular
+  /// relay. Three well known ones failed that check. relay.damus.io demands
+  /// NIP-42 for DM kinds and then refuses its own auth with a server side
+  /// configuration error, relay.nostr.band accepted a publish and never served
+  /// it back, and relay.nostr.bg would not accept one at all.
+  static final _relayUrls = [
+    Uri.parse('wss://nos.lol'),
+    Uri.parse('wss://relay.primal.net'),
+    Uri.parse('wss://nostr.mom'),
+    Uri.parse('wss://offchain.pub'),
+  ];
 
   /// Brings up the internet path alongside the radio.
   ///
@@ -157,10 +165,11 @@ class _HomePageState extends State<HomePage> {
       // The seed is already loaded for the mesh identity, and the Nostr key
       // is the third thing derived from it. Nothing extra to store or unlock.
       final nostr = await NostrIdentity.fromSeed(_link.identity.seed);
-      final bridge = NostrBridge(
-        identity: nostr,
-        client: RelayClient(_relayUrl, secretKey: nostr.privateKeyHex),
+      final pool = RelayPool.forUrls(
+        _relayUrls,
+        secretKey: nostr.privateKeyHex,
       );
+      final bridge = NostrBridge(identity: nostr, client: pool);
 
       _nostr = nostr;
       _bridge = bridge;
@@ -174,7 +183,7 @@ class _HomePageState extends State<HomePage> {
       // Worth showing: this is the address peers will be told, and the only
       // way to see it on a phone that is not plugged into anything.
       _link.note('nostr identity ${nostr.shortNpub}');
-      _link.note('relay $_relayUrl');
+      _link.note('${_relayUrls.length} relays');
     } catch (_) {
       // Logged nowhere on purpose: there is nothing a user can do about a
       // relay being down, and the chip already says so.
