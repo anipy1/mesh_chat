@@ -154,6 +154,16 @@ class NodeIdentity {
   /// Empty salt is the standard construction when there is no salt to speak of.
   /// The separation that matters here comes from [info], which is what stops
   /// the signing key and the noise key from being related.
+  ///
+  /// Public because the Nostr identity derives from the same seed with its own
+  /// info string, and two copies of a key derivation is two things to get
+  /// subtly different.
+  static Future<List<int>> deriveKeyMaterial(
+    Uint8List seed,
+    String info,
+  ) =>
+      _derive(seed, info);
+
   static Future<List<int>> _derive(Uint8List seed, String info) async {
     final hkdf = Hkdf(hmac: Hmac.sha256(), outputLength: 32);
     final out = await hkdf.deriveKey(

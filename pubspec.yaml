@@ -17,6 +17,7 @@ dependencies:
   # fails inside the plugin. Nothing in our code needs the newer API. Worth
   # retrying once the SDK ships that platform with sane metadata.
   flutter_secure_storage: ^9.2.4
+  nostr: ^2.0.0
 
 dev_dependencies:
   flutter_test:
