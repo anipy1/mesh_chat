@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:math';
 import 'dart:io';
 
@@ -9,6 +8,7 @@ import 'package:flutter/foundation.dart';
 import 'fragment_assembler.dart';
 import 'frame.dart';
 import 'outbox.dart';
+import 'sealed_payload.dart';
 import '../identity/identity_store.dart';
 import '../identity/node_identity.dart';
 import '../noise/noise_protocol.dart';
@@ -88,6 +88,7 @@ class MeshLink {
           LogLevel.info,
           'session with ${labelOf(peer)} established ($role)',
         );
+        unawaited(_shareNostrAddress(peer));
         unawaited(_flushOutbox(peer));
       },
       onFailed: (peer, why) => _log(
@@ -109,6 +110,13 @@ class MeshLink {
   /// Messages waiting for a session, kept as plaintext so they can be sealed
   /// against whatever session exists when the peer finally turns up.
   final Outbox _outbox = Outbox();
+
+  /// Nostr public keys, by mesh peer id, as told to us inside a session.
+  ///
+  /// Never from an announce or any other unauthenticated source. A peer's
+  /// internet address is exactly the thing worth lying about: claim someone
+  /// else's npub and their messages come to you instead.
+  final Map<String, String> _nostrAddresses = {};
 
   /// Tells the mesh we exist, so peers that are not neighbours can find us.
   Timer? _announceTimer;
@@ -697,6 +705,7 @@ class MeshLink {
     _retiredKeys.clear();
     _announced.clear();
     _outbox.clear();
+    _nostrAddresses.clear();
     _assembler.clear();
     _connected.clear();
 
@@ -756,7 +765,7 @@ class MeshLink {
       await _sessions.ensure(peer);
       return;
     }
-    final sealed = await _sessions.seal(peer, utf8.encode(text));
+    final sealed = await _sessions.seal(peer, SealedPayload.encodeText(text));
     if (sealed == null) return;
     await _flood(
       Frame.sealed(
@@ -768,6 +777,38 @@ class MeshLink {
       'sealed to ${labelOf(peer)}',
     );
   }
+
+  /// Tells a peer where to reach us when the radio cannot.
+  ///
+  /// Sent through the session rather than announced, because an unauthenticated
+  /// claim about an address is worth nothing: anyone could publish ours and
+  /// collect messages meant for us. Inside the session only we could have sent
+  /// it.
+  Future<void> _shareNostrAddress(String peer) async {
+    final address = nostrPublicKey;
+    if (address == null) return;
+    final sealed = await _sessions.seal(
+      peer,
+      SealedPayload.encodeNostrAddress(address),
+    );
+    if (sealed == null) return;
+    await _flood(
+      Frame.sealed(
+        dest: peer,
+        src: identity.peerId,
+        counter: sealed.counter,
+        ciphertext: sealed.ciphertext,
+      ),
+      'nostr address to ${labelOf(peer)}',
+    );
+  }
+
+  /// Where a peer can be reached over the internet, if they have told us.
+  String? nostrAddressFor(String peer) => _nostrAddresses[peer];
+
+  /// Our own Nostr key, when the app has one. Set by whoever wires the
+  /// internet transport; the mesh works perfectly well without it.
+  String? nostrPublicKey;
 
   /// Sends everything that was waiting for this peer.
   ///
@@ -1270,11 +1311,38 @@ class MeshLink {
         envelope.counter,
         envelope.ciphertext,
       );
-      final text = utf8.decode(plain, allowMalformed: true);
       // A message that opened could only have come from them, and for a peer
       // reached through a relay this is the only evidence there is: a hello
       // never travels that far.
       _sessions.noteSeen(envelope.src);
+
+      final payload = SealedPayload.parse(plain);
+      if (payload == null) {
+        // Authenticated, so it really is from them, just a kind this build
+        // does not know. Same rule as the outer frame: do not render it.
+        _log(
+          LogLevel.warn,
+          'sealed payload from ${envelope.srcLabel} is a kind we do not know',
+        );
+        return;
+      }
+
+      if (payload.kind == SealedKind.nostrAddress) {
+        // Their internet address, learned through the one channel where the
+        // claim cannot be forged.
+        final known = _nostrAddresses[envelope.src];
+        _nostrAddresses[envelope.src] = payload.hex;
+        if (known != payload.hex) {
+          _log(
+            LogLevel.info,
+            'nostr address for ${envelope.srcLabel}: '
+            '${payload.hex.substring(0, 12)}...',
+          );
+        }
+        return;
+      }
+
+      final text = payload.text;
       _log(
         LogLevel.rx,
         'sealed message from ${envelope.srcLabel}, '
